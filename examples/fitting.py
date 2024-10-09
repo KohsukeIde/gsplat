@@ -36,15 +36,18 @@ class SimpleTrainer:
 
     def _init_gaussians(self):
         """Initialize random 2D gaussians"""
-        self.means = torch.rand(self.num_points, 2, device=self.device) * torch.tensor([self.W, self.H], device=self.device)
-        self.scales = torch.rand(self.num_points, 2, device=self.device) * 10  # scales for x and y
-        self.rotations = torch.rand(self.num_points, device=self.device) * 2 * math.pi  # rotation in radians
-        self.rgbs = torch.rand(self.num_points, 3, device=self.device)
-        self.opacities = torch.ones(self.num_points, device=self.device) * 0.1
+        bd = 2
+        d = 3
 
-        # Z軸に関するパラメータを追加
-        self.z_means = torch.zeros(self.num_points, 1, device=self.device, requires_grad=True)
-        self.scales_z = torch.ones(self.num_points, 1, device=self.device, requires_grad=True)
+        self.means = bd * (torch.rand(self.num_points, 2, device=self.device) - 0.5)
+        self.scales = torch.rand(self.num_points, 2, device=self.device)  # scales for x and y
+        self.rotations = torch.rand(self.num_points, device=self.device) * 2 * math.pi  # rotation in radians
+        self.rgbs = torch.rand(self.num_points, d, device=self.device)
+        self.opacities = torch.ones(self.num_points, device=self.device)
+
+        # Z軸に関するパラメータを追加（grad off）
+        self.z_means = torch.zeros(self.num_points, 1, device=self.device)
+        self.scales_z = torch.ones(self.num_points, 1, device=self.device)
 
   
 
@@ -91,10 +94,9 @@ class SimpleTrainer:
         lr: float = 0.01,
         save_imgs: bool = False,
     ):
-        # オプティマイザにZ軸のパラメータも含める
         optimizer = optim.Adam([
-            self.means, self.scales, self.rotations, self.rgbs, self.opacities, self.z_means, self.scales_z
-        ], lr=lr)
+            self.means, self.scales, self.rotations, self.rgbs, self.opacities, 
+            ], lr=lr)
         mse_loss = torch.nn.MSELoss()
         frames = []
         times = [0] * 2  # rasterization, backward
@@ -148,7 +150,7 @@ class SimpleTrainer:
             torch.cuda.synchronize()
             times[1] += time.time() - start
 
-            # 勾配の確認（最初の5イテレーションのみ）
+            # 勾配の確認（first 5iter）
             if iter < 5:
                 print(f"Iteration {iter + 1}/{iterations}, Loss: {loss.item()}")
                 print(f"means grad mean: {self.means.grad.abs().mean().item() if self.means.grad is not None else 'None'}")
@@ -161,17 +163,12 @@ class SimpleTrainer:
 
                 # sys.exit()
 
-            # パラメータ更新
             optimizer.step()
-
-            # 損失出力
             print(f"Iteration {iter + 1}/{iterations}, Loss: {loss.item()}")
-
-            # 100イテレーションごとにレンダリング画像の統計を出力
+            
             if iter % 100 == 0:
                 print(f"Rendered image mean: {out_img.mean().item()}, std: {out_img.std().item()}")
 
-            # レンダリング画像の保存
             if save_imgs and iter % 5 == 0:
                 frames.append((out_img.detach().cpu().numpy() * 255).astype(np.uint8))
 
@@ -195,9 +192,13 @@ class SimpleTrainer:
 
         return self.get_gaussians()
 
-def image_path_to_tensor(image_path: Path) -> Tensor:
-    img = Image.open(image_path).convert('RGB')
-    return torch.FloatTensor(np.array(img)) / 255.0
+def image_path_to_tensor(image_path: Path):
+    import torchvision.transforms as transforms
+
+    img = Image.open(image_path)
+    transform = transforms.ToTensor()
+    img_tensor = transform(img).permute(1, 2, 0)[..., :3]
+    return img_tensor
 
 def main(
     height: int = 256,
@@ -211,8 +212,8 @@ def main(
     if img_path:
         gt_image = image_path_to_tensor(img_path)
     else:
-        gt_image = torch.ones((height, width, 3), device=torch.device("cuda" if torch.cuda.is_available() else "cpu")) * 1.0
-        # 左上と右下を赤と青に設定
+        gt_image = torch.ones((height, width, 3), device=torch.device("cuda" if torch.cuda.is_available() else "cpu")) * 1.0 # make top left and bottom right red, blue
+        # make top left and bottom right red, blue
         gt_image[: height // 2, : width // 2, :] = torch.tensor([1.0, 0.0, 0.0], device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         gt_image[height // 2 :, width // 2 :, :] = torch.tensor([0.0, 0.0, 1.0], device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
