@@ -12,7 +12,7 @@ from PIL import Image
 from torch import Tensor, optim
 
 from gsplat import rasterization
-from twodgs import TwoDGaussians  # 正しいパスに変更してください
+from twodgs import TwoDGaussians  
 
 class SimpleTrainer:
     """Trains 2D gaussians to fit an image."""
