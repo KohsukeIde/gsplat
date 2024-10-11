@@ -4,6 +4,8 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional
+import pickle
+
 
 import numpy as np
 import torch
@@ -84,9 +86,29 @@ class SimpleTrainer:
         return TwoDGaussians(
             means=self.means.detach().cpu().numpy(),
             covs=covs.detach().cpu().numpy(),
-            rgb=self.rgbs.detach().cpu().numpy(),
-            alpha=torch.sigmoid(self.opacities).detach().cpu().numpy()
+            rgb=torch.sigmoid(self.rgbs).detach().cpu().numpy(),
+            alpha=torch.sigmoid(self.opacities).detach().cpu().numpy(),
+            rotations=self.rotations.detach().cpu().numpy(),  
+            scales=self.scales.detach().cpu().numpy()         
         )
+            
+    def save_gaussians(self, gaussians: TwoDGaussians, file_path: str):
+        print(f"Saving means: {gaussians.means[:5]}")
+        print(f"Saving covs: {gaussians.covs[:5]}")
+        print(f"Saving rgbs: {gaussians.rgb[:5]}")
+        print(f"Saving alphas: {gaussians.alpha[:5]}")
+        data = {
+            "gaussians": gaussians,
+            "viewmat": self.viewmat.detach().cpu().numpy(),
+            "K": torch.tensor([
+                [self.focal, 0, self.W / 2],
+                [0, self.focal, self.H / 2],
+                [0, 0, 1],
+            ], device=self.device).detach().cpu().numpy()
+        }
+        with open(file_path, 'wb') as f:
+            pickle.dump(data, f)
+        print(f"Saved gaussians and camera parameters to {file_path}")
 
     def train(
         self,
@@ -129,6 +151,13 @@ class SimpleTrainer:
                 print(f"scales_3d shape: {scales_3d.shape}")                  # [N, 3]
                 print(f"K shape: {K.shape}")                              # [3, 3]
                 print(f"viewmat shape: {self.viewmat.shape}")                  # [4, 4]
+            
+            # print(f"{self.means=}")
+            # print(f"{self.z_means=}")
+            # print(f"{self.scales=}")
+            # print(f"{self.scales_z=}")
+
+
             renders, _, _ = rasterization(
                 means_3d,                # [N, 3]
                 quats_normalized,        # [N, 4]
@@ -171,7 +200,7 @@ class SimpleTrainer:
 
             if save_imgs and iter % 5 == 0:
                 frames.append((out_img.detach().cpu().numpy() * 255).astype(np.uint8))
-
+ 
         if save_imgs and len(frames) > 0:
             frames = [Image.fromarray(frame) for frame in frames]
             out_dir = os.path.join(os.getcwd(), "renders")
@@ -189,7 +218,12 @@ class SimpleTrainer:
         print(
             f"Per step(s):\nRasterization: {times[0]/iterations:.5f}, Backward: {times[1]/iterations:.5f}"
         )
-
+        print(f"Final means: {self.means}")
+        print(f"Final scales: {self.scales}")
+        print(f"Final rotations: {self.rotations}")
+        print(f"Final rgbs: {self.rgbs}")
+        print(f"Final opacities: {self.opacities}")
+        
         return self.get_gaussians()
 
 def image_path_to_tensor(image_path: Path):
@@ -208,6 +242,7 @@ def main(
     img_path: Optional[Path] = None,
     iterations: int = 5000,
     lr: float = 0.01,
+    output_path: str = 'fitted_gaussians.pkl',
 ) -> None:
     if img_path:
         gt_image = image_path_to_tensor(img_path)
@@ -225,6 +260,8 @@ def main(
     )
     
     print(f"Fitted {fitted_gaussians.k} Gaussians")
+    trainer.save_gaussians(fitted_gaussians, output_path)
+    print(f"Saved fitted Gaussians to {output_path}")
 
 if __name__ == "__main__":
     tyro.cli(main)
