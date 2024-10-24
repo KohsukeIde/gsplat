@@ -1,5 +1,6 @@
 import math
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -333,7 +334,7 @@ def image_path_to_tensor(image_path: Path):
 def main(
     height: int = 256,
     width: int = 256,
-    num_points: int = 1000,
+    num_points: int = 200,
     save_imgs: bool = True,
     img_path: Optional[Path] = None,
     iterations: int = 2000,
@@ -356,7 +357,7 @@ def main(
         )
 
     print(f"Fitted {original_gaussians.k} Gaussians")
-
+    # ガウス分布はすでに保存されているので、再度保存する必要はありません
 
     trainer.plot_loss(save_path="loss_curve.png")
 
