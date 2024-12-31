@@ -143,8 +143,8 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Render Gaussians from Pickle File")
-    parser.add_argument("pickle_path", type=str, help="Path to the fitted_gaussians.pkl file")
-    parser.add_argument("output_image_path", type=str, help="Path to save the rendered image")
+    parser.add_argument("--pickle_path", type=str, help="Path to the fitted_gaussians.pkl file")
+    parser.add_argument("--output_image_path", type=str, help="Path to save the rendered image")
     parser.add_argument("--image_size", type=int, nargs=2, default=[1554, 1162], help="Width and height of the output image")
 
     args = parser.parse_args()
