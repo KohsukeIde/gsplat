@@ -18,18 +18,14 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from torch import Tensor, optim
 
-# These libraries must be installed:
-#   gsplat (for rasterization)
-#   twodgs (for TwoDGaussians class)
-#   lpips (for LPIPS metric)
-#   pytorch_msssim (for SSIM metric)
+# Required libraries:
+#   pip install gsplat twodgs lpips pytorch-msssim
 from gsplat import rasterization
 from twodgs import TwoDGaussians
 
 # Additional metrics
 import lpips
 from pytorch_msssim import ssim as ssim_fn
-
 
 def calculate_psnr(img: np.ndarray, gt: np.ndarray, max_val: float = 1.0) -> float:
     """Calculate PSNR between img and gt."""
@@ -39,12 +35,8 @@ def calculate_psnr(img: np.ndarray, gt: np.ndarray, max_val: float = 1.0) -> flo
     psnr = 20 * math.log10(max_val / math.sqrt(mse))
     return psnr
 
-
 def calculate_lpips(img: np.ndarray, gt: np.ndarray, device: torch.device = torch.device('cpu')) -> float:
-    """
-    Calculate LPIPS between img and gt.
-    img, gt: numpy arrays in [0,1], shape [H,W,3]
-    """
+    """Calculate LPIPS between img and gt in [0..1], shape [H,W,3]."""
     loss_fn_vgg = lpips.LPIPS(net='vgg').to(device)
     # LPIPS expects inputs in [-1, +1]
     img_t = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(device).float() * 2.0 - 1.0
@@ -53,18 +45,13 @@ def calculate_lpips(img: np.ndarray, gt: np.ndarray, device: torch.device = torc
         lpips_val = loss_fn_vgg(img_t, gt_t).item()
     return lpips_val
 
-
 def calculate_ssim(img: np.ndarray, gt: np.ndarray, device: torch.device = torch.device('cpu')) -> float:
-    """
-    Calculate SSIM between img and gt.
-    img, gt: [H,W,3] in [0,1]
-    """
+    """Calculate SSIM between img and gt in [0..1], shape [H,W,3]."""
     img_t = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(device).float()
     gt_t = torch.from_numpy(gt).permute(2, 0, 1).unsqueeze(0).to(device).float()
     with torch.no_grad():
         ssim_val = ssim_fn(img_t, gt_t, data_range=1.0, size_average=True)
     return ssim_val.item()
-
 
 @dataclass
 class TrainArgs:
@@ -79,7 +66,6 @@ class TrainArgs:
     output_path: str = 'fitted_gaussians.pkl'
     num_gpus: int = 1
 
-
 @dataclass
 class ExperimentArgs:
     img_path: Optional[str] = None
@@ -92,49 +78,50 @@ class ExperimentArgs:
     auto_plot: bool = True
     num_gpus: int = 1
 
-
 @dataclass
 class PlotArgs:
     csv_path: str = "experiment_results.csv"
 
-
 class SimpleTrainer:
-    """Trains 2D gaussians to fit an image."""
+    """
+    Trains 2D gaussians to fit an image, using orthographic camera and no culling:
+      - camera_model="ortho"
+      - eps2d=0.0
+      - near_plane=-1e10, far_plane=1e10
+      - radius_clip=-1.0
+    """
 
-    def __init__(
-        self,
-        gt_image: Tensor,
-        num_points: int = 2000,
-    ):
+    def __init__(self, gt_image: Tensor, num_points: int = 2000):
         self.device = gt_image.device
         print(f"Using device: {self.device}")
         self.gt_image = gt_image
         self.num_points = num_points
         self.losses = []
 
-        fov_x = math.pi / 2.0
         self.H, self.W = gt_image.shape[0], gt_image.shape[1]
+        # We define a focal length, but in orthographic mode it's not truly used
+        fov_x = math.pi / 2.0
         self.focal = 0.5 * float(self.W) / math.tan(0.5 * fov_x)
 
         self._init_gaussians()
 
     def _init_gaussians(self):
-        """Initialize random 2D gaussians"""
+        """Initialize random 2D gaussians, put them in 3D at z=+1."""
         bd = 2
         d = 3
 
-        # X,Y in [-1, +1], random
-        self.means = bd * (torch.rand(self.num_points, 2, device=self.device) - 0.5)  # [N, 2]
-        self.scales = torch.rand(self.num_points, 2, device=self.device)  # [N, 2]
+        # means in [-1, +1] for (x,y)
+        self.means = bd * (torch.rand(self.num_points, 2, device=self.device) - 0.5)  # [N,2]
+        self.scales = torch.rand(self.num_points, 2, device=self.device)  # [N,2]
         self.rotations = torch.rand(self.num_points, device=self.device) * 2 * math.pi  # [N]
-        self.rgbs = torch.rand(self.num_points, d, device=self.device)  # [N, 3]
+        self.rgbs = torch.rand(self.num_points, d, device=self.device)  # [N,3]
         self.opacities = torch.ones(self.num_points, device=self.device)  # [N]
 
-        # Z-axis parameters
-        self.z_means = torch.zeros(self.num_points, 1, device=self.device)  # [N,1]
-        self.scales_z = torch.ones(self.num_points, 1, device=self.device)  # [N,1]
+        # Z=+1 so they're clearly in front for orthographic
+        self.z_means = torch.ones(self.num_points, 1, device=self.device)
+        self.scales_z = torch.ones(self.num_points, 1, device=self.device)
 
-        # 4x4 extrinsic view matrix
+        # Orthographic camera
         self.viewmat = torch.tensor(
             [
                 [1.0, 0.0, 0.0, 0.0],
@@ -145,7 +132,7 @@ class SimpleTrainer:
             device=self.device,
         )  # [4,4]
 
-        # Mark parameters as requiring grad
+        # Make them trainable
         self.means.requires_grad = True
         self.scales.requires_grad = True
         self.rotations.requires_grad = True
@@ -153,151 +140,152 @@ class SimpleTrainer:
         self.opacities.requires_grad = True
         self.viewmat.requires_grad = False
 
-        # Optionally, you can visualize the initial 2D positions:
-        self.plot_initial_means(save_path='initial_means.png')
-
-        # Will hold the meta data from rasterization
+        # We'll store rasterization metadata here
         self.meta = None
 
-    def plot_initial_means(self, save_path: str = 'initial_means.png'):
-        """Plot the initial Gaussian centers in the image coordinate space and save."""
-        means = self.means.detach().cpu().numpy()
-        means_x = (means[:, 0] + 1.0) / 2.0 * self.W
-        means_y = (means[:, 1] + 1.0) / 2.0 * self.H
+        # Optional: visualize initial positions
+        self.plot_initial_means()
 
-        plt.figure(figsize=(6, 6))
-        plt.scatter(means_x, means_y, s=2, color='blue')
+    def plot_initial_means(self, save_path='initial_means.png'):
+        """Plot the initial 2D means in image space."""
+        means_np = self.means.detach().cpu().numpy()
+        mx = (means_np[:, 0] + 1.0) / 2.0 * self.W
+        my = (means_np[:, 1] + 1.0) / 2.0 * self.H
+
+        plt.figure(figsize=(5,5))
+        plt.scatter(mx, my, s=3, c='blue')
         plt.xlim(0, self.W)
         plt.ylim(self.H, 0)
-        plt.title('Initial Gaussian Centers')
-        plt.xlabel('X')
-        plt.ylabel('Y')
-        plt.grid(True)
+        plt.title("Initial 2D Gaussian Centers")
         plt.savefig(save_path)
         plt.close()
-        print(f"Initial Gaussian centers plotted: {save_path}")
+        print(f"Initial means plotted: {save_path}")
 
     def _get_covs(self):
-        """Convert scales and rotations to covariance matrices in 2D."""
+        """Compute 2x2 covariance from (scales, rotations)."""
         cos_r = torch.cos(self.rotations)
         sin_r = torch.sin(self.rotations)
-        # R is the rotation matrix
         R = torch.stack([
             torch.stack([cos_r, -sin_r], dim=1),
             torch.stack([sin_r,  cos_r], dim=1)
         ], dim=1)  # [N, 2, 2]
-        # S is diag(scales)
         S = torch.diag_embed(self.scales)  # [N, 2, 2]
-        return R @ S @ S.transpose(1, 2) @ R.transpose(1, 2)  # [N, 2, 2]
+        return R @ S @ S.transpose(1,2) @ R.transpose(1,2)  # [N,2,2]
 
     def get_gaussians(self) -> Tuple[TwoDGaussians, Optional[TwoDGaussians]]:
-        """Return TwoDGaussians object for the original and projected gaussians."""
+        """
+        Return (original_gaussians, projected_gaussians).
+        But note that 'projected_gaussians' might be None if
+        some are culled or if meta doesn't match.
+        """
         with torch.no_grad():
             covs = self._get_covs()
-
-        original_gaussians = TwoDGaussians(
-            means=self.means.detach().cpu().numpy(),
-            covs=covs.detach().cpu().numpy(),
-            rgb=torch.sigmoid(self.rgbs).detach().cpu().numpy(),
-            alpha=torch.sigmoid(self.opacities).detach().cpu().numpy(),
-            rotations=self.rotations.detach().cpu().numpy(),
-            scales=self.scales.detach().cpu().numpy(),
+        original_gs = TwoDGaussians(
+            means=self.means.cpu().numpy(),
+            covs=covs.cpu().numpy(),
+            rgb=torch.sigmoid(self.rgbs).cpu().numpy(),
+            alpha=torch.sigmoid(self.opacities).cpu().numpy(),
+            rotations=self.rotations.cpu().numpy(),
+            scales=self.scales.cpu().numpy(),
         )
 
         if self.meta is not None:
-            means2d = self.meta['means2d'].detach().cpu().numpy()  # [N,2]
-            conics = self.meta['conics'].detach().cpu().numpy()    # [N,3]
-
+            means2d = self.meta['means2d'].detach().cpu().numpy()   # shape [M,2]
+            conics = self.meta['conics'].detach().cpu().numpy()     # shape [M,3]
+            M = means2d.shape[0]
             A = conics[:, 0]
             B = conics[:, 1]
             C = conics[:, 2]
+            inv_covs = np.zeros((M, 2, 2))
+            inv_covs[:,0,0] = A
+            inv_covs[:,0,1] = B/2
+            inv_covs[:,1,0] = B/2
+            inv_covs[:,1,1] = C
+            covs2d = np.linalg.inv(inv_covs)
 
-            N = conics.shape[0]
-            inv_covs = np.zeros((N, 2, 2))
-            inv_covs[:, 0, 0] = A
-            inv_covs[:, 0, 1] = B / 2
-            inv_covs[:, 1, 0] = B / 2
-            inv_covs[:, 1, 1] = C
-
-            covs2d = np.linalg.inv(inv_covs)  # [N,2,2]
-
-            rgbs = torch.sigmoid(self.rgbs).detach().cpu().numpy()  # [N,3]
-            alphas = torch.sigmoid(self.opacities).detach().cpu().numpy()  # [N]
-
-            projected_gaussians = TwoDGaussians(
-                means=means2d,
-                covs=covs2d,
-                rgb=rgbs,
-                alpha=alphas,
-                rotations=self.rotations.detach().cpu().numpy(),
-                scales=self.scales.detach().cpu().numpy()
-            )
+            if M != self.num_points:
+                print(f"Warning: {M}/{self.num_points} Gaussians appear on-screen! Skipping projected.")
+                projected_gs = None
+            else:
+                projected_gs = TwoDGaussians(
+                    means=means2d,
+                    covs=covs2d,
+                    rgb=torch.sigmoid(self.rgbs).cpu().numpy(),
+                    alpha=torch.sigmoid(self.opacities).cpu().numpy(),
+                    rotations=self.rotations.cpu().numpy(),
+                    scales=self.scales.cpu().numpy(),
+                )
         else:
-            projected_gaussians = None
+            projected_gs = None
 
-        return original_gaussians, projected_gaussians
+        return original_gs, projected_gs
 
     def train(
         self,
-        iterations: int = 2000,
-        lr: float = 0.01,
-        save_imgs: bool = False,
-        output_pkl: Optional[str] = None,
+        iterations: int=2000,
+        lr: float=0.01,
+        save_imgs: bool=False,
+        output_pkl: Optional[str]=None
     ) -> Tuple[TwoDGaussians, Optional[TwoDGaussians], np.ndarray]:
         """
-        Train loop to minimize MSE loss between rasterized Gaussians and gt_image.
+        Train loop using an orthographic camera, eps2d=0.0, no culling, etc.
         """
         optimizer = optim.Adam([
-            self.means, self.scales, self.rotations, self.rgbs, self.opacities,
+            self.means, self.scales, self.rotations, self.rgbs, self.opacities
         ], lr=lr)
         mse_loss_fn = torch.nn.MSELoss()
         frames = []
-        times = [0, 0]  # [rasterization_time, backward_time]
+        times = [0.0, 0.0]  # [rasterize_time, backward_time]
         K = torch.tensor([
-            [self.focal, 0, self.W / 2],
-            [0, self.focal, self.H / 2],
+            [self.focal, 0, self.W/2],
+            [0, self.focal, self.H/2],
             [0, 0, 1],
         ], device=self.device)
 
         final_out_img = None
 
-        for iter_idx in range(iterations):
+        for i in range(iterations):
             start = time.time()
             optimizer.zero_grad()
 
-            means_3d = torch.cat([self.means, self.z_means], dim=1)      # [N,3]
-            scales_3d = torch.cat([self.scales, self.scales_z], dim=1)  # [N,3]
+            means_3d = torch.cat([self.means, self.z_means], dim=1)       # [N,3]
+            scales_3d = torch.cat([self.scales, self.scales_z], dim=1)   # [N,3]
 
             quats = torch.stack([
-                torch.cos(self.rotations / 2),
+                torch.cos(self.rotations/2),
                 torch.zeros_like(self.rotations),
                 torch.zeros_like(self.rotations),
-                torch.sin(self.rotations / 2)
+                torch.sin(self.rotations/2)
             ], dim=1)
-            quats_normalized = quats / quats.norm(dim=-1, keepdim=True)
+            quats_norm = quats / quats.norm(dim=-1, keepdim=True)
 
-            # Rasterize
+            # Orthographic, no culling:
+            #   camera_model="ortho", eps2d=0.0, near_plane=-1e10,
+            #   far_plane=1e10, radius_clip=-1.0
             renders, _, meta = rasterization(
                 means_3d,
-                quats_normalized,
+                quats_norm,
                 scales_3d,
                 torch.sigmoid(self.opacities),
                 torch.sigmoid(self.rgbs),
-                self.viewmat[None],
-                K[None],
+                self.viewmat[None],   # shape [1,4,4]
+                K[None],              # shape [1,3,3]
                 self.W,
                 self.H,
+                camera_model="ortho",
+                # eps2d=0.0,
+                near_plane=-1e10,
+                far_plane=1e10,
+                radius_clip=-1.0,
+                rasterize_mode="classic",
             )
 
-            out_img = renders[0]
+            out_img = renders[0]  # [H,W,3]
             if self.device.type == 'cuda':
                 torch.cuda.synchronize()
             times[0] += time.time() - start
 
-            # compute MSE loss
             loss = mse_loss_fn(out_img, self.gt_image)
-
-            # Backprop
             start = time.time()
             loss.backward()
             if self.device.type == 'cuda':
@@ -307,19 +295,19 @@ class SimpleTrainer:
             self.losses.append(loss.item())
             optimizer.step()
 
-            if (iter_idx + 1) % 50 == 0:
-                print(f"Iteration {iter_idx + 1}/{iterations}, Loss: {loss.item():.6f}")
+            if (i+1) % 50 == 0:
+                print(f"Iteration {i+1}/{iterations}, Loss: {loss.item():.6f}")
 
-            if save_imgs and (iter_idx % 5 == 0):
+            if save_imgs and i % 5 == 0:
                 frames.append((out_img.detach().cpu().numpy() * 255).astype(np.uint8))
 
             final_out_img = out_img.detach().cpu().numpy()
+            self.meta = meta
 
-        # optionally save a gif
-        if save_imgs and len(frames) > 0:
-            frames_pil = [Image.fromarray(frame) for frame in frames]
+        if save_imgs and frames:
             out_dir = os.path.join(os.getcwd(), "renders")
             os.makedirs(out_dir, exist_ok=True)
+            frames_pil = [Image.fromarray(frame) for frame in frames]
             frames_pil[0].save(
                 f"{out_dir}/training.gif",
                 save_all=True,
@@ -330,25 +318,24 @@ class SimpleTrainer:
             )
 
         print(f"[Timing] Total: Rasterization: {times[0]:.3f}s, Backward: {times[1]:.3f}s")
-        print(f"[Timing] Per step: R {times[0]/iterations:.5f}s, B {times[1]/iterations:.5f}s")
+        print(f"[Timing] Per step: R={times[0]/iterations:.6f}, B={times[1]/iterations:.6f}")
 
-        self.meta = meta
-        original_gaussians, projected_gaussians = self.get_gaussians()
+        original_gs, projected_gs = self.get_gaussians()
 
-        # If user wants to save PKL
         if output_pkl is not None:
-            self.save_gaussians(original_gaussians, projected_gaussians, output_pkl)
+            self.save_gaussians(original_gs, projected_gs, output_pkl)
 
-        return original_gaussians, projected_gaussians, final_out_img
+        return original_gs, projected_gs, final_out_img
 
-    def plot_loss(self, save_path: str = 'loss_curve.png'):
-        plt.figure(figsize=(10, 6))
-        plt.plot(self.losses)
-        plt.title('Training Loss Over Time')
-        plt.xlabel('Iteration')
-        plt.ylabel('Loss')
-        plt.yscale('log')
+    def plot_loss(self, save_path='loss_curve.png'):
+        plt.figure(figsize=(8,5))
+        plt.plot(self.losses, label="MSE Loss")
+        plt.title("Training Loss")
+        plt.xlabel("Iteration")
+        plt.ylabel("Loss")
+        plt.yscale("log")
         plt.grid(True)
+        plt.legend()
         plt.savefig(save_path)
         plt.close()
         print(f"Loss curve saved: {save_path}")
@@ -358,7 +345,7 @@ class SimpleTrainer:
         import pickle
         data = {
             'original': original_gs,
-            'projected': projected_gs,
+            'projected': projected_gs
         }
         with open(path, 'wb') as f:
             pickle.dump(data, f)
@@ -366,85 +353,87 @@ class SimpleTrainer:
 
 
 def image_path_to_tensor(image_path: Path, device: torch.device = None) -> Tensor:
+    """Loads an image and returns shape [H,W,3] in [0..1]."""
     import torchvision.transforms as transforms
-
     img = Image.open(image_path).convert('RGB')
     transform = transforms.ToTensor()
-    img_tensor = transform(img).permute(1, 2, 0)[..., :3]  # shape [H,W,3]
+    tensor = transform(img).permute(1,2,0)
     if device is not None:
-        img_tensor = img_tensor.to(device)
-    return img_tensor
-
+        tensor = tensor.to(device)
+    return tensor
 
 def plot_results_from_csv(csv_path: str) -> None:
+    """Reads CSV experiment results and plots PSNR, LPIPS, SSIM vs. num_points for each iteration count."""
     data = []
     with open(csv_path, "r") as f:
         reader = csv.DictReader(f)
         for row in reader:
             data.append({
-                "image_name": row.get("image_name", "unknown"),
+                "image_name": row.get("image_name","unknown"),
                 "num_points": int(row["num_points"]),
                 "iterations": int(row["iterations"]),
                 "psnr": float(row["psnr"]),
                 "lpips": float(row["lpips"]),
-                "ssim": float(row["ssim"]),
+                "ssim": float(row["ssim"])
             })
 
+    from collections import defaultdict
     results_by_iterations = defaultdict(list)
     for entry in data:
         results_by_iterations[entry["iterations"]].append(entry)
 
-    for iters, vals in results_by_iterations.items():
-        vals.sort(key=lambda x: x["num_points"])
+    # Sort each group by num_points
+    for iters, group in results_by_iterations.items():
+        group.sort(key=lambda x: x["num_points"])
 
-    # Plot PSNR vs num_points
-    plt.figure(figsize=(10, 6))
-    for iters, vals in results_by_iterations.items():
-        x = [v["num_points"] for v in vals]
-        y = [v["psnr"] for v in vals]
+    # Plot PSNR
+    plt.figure(figsize=(10,6))
+    for iters, group in results_by_iterations.items():
+        x = [g["num_points"] for g in group]
+        y = [g["psnr"] for g in group]
         plt.plot(x, y, marker='o', label=f"iters={iters}")
-    plt.title("PSNR vs num_points")
     plt.xlabel("num_points")
-    plt.ylabel("PSNR (Higher is better)")
+    plt.ylabel("PSNR")
+    plt.title("PSNR vs num_points")
     plt.grid(True)
     plt.legend()
     plt.savefig("psnr_vs_num_points.png")
     plt.close()
     print("PSNR plot saved: psnr_vs_num_points.png")
 
-    # Plot LPIPS vs num_points
-    plt.figure(figsize=(10, 6))
-    for iters, vals in results_by_iterations.items():
-        x = [v["num_points"] for v in vals]
-        y = [v["lpips"] for v in vals]
+    # Plot LPIPS
+    plt.figure(figsize=(10,6))
+    for iters, group in results_by_iterations.items():
+        x = [g["num_points"] for g in group]
+        y = [g["lpips"] for g in group]
         plt.plot(x, y, marker='o', label=f"iters={iters}")
-    plt.title("LPIPS vs num_points")
     plt.xlabel("num_points")
     plt.ylabel("LPIPS (Lower is better)")
+    plt.title("LPIPS vs num_points")
     plt.grid(True)
     plt.legend()
     plt.savefig("lpips_vs_num_points.png")
     plt.close()
     print("LPIPS plot saved: lpips_vs_num_points.png")
 
-    # Plot SSIM vs num_points
-    plt.figure(figsize=(10, 6))
-    for iters, vals in results_by_iterations.items():
-        x = [v["num_points"] for v in vals]
-        y = [v["ssim"] for v in vals]
+    # Plot SSIM
+    plt.figure(figsize=(10,6))
+    for iters, group in results_by_iterations.items():
+        x = [g["num_points"] for g in group]
+        y = [g["ssim"] for g in group]
         plt.plot(x, y, marker='o', label=f"iters={iters}")
-    plt.title("SSIM vs num_points")
     plt.xlabel("num_points")
     plt.ylabel("SSIM (Higher is better)")
+    plt.title("SSIM vs num_points")
     plt.grid(True)
     plt.legend()
     plt.savefig("ssim_vs_num_points.png")
     plt.close()
     print("SSIM plot saved: ssim_vs_num_points.png")
 
-
 def load_images_from_folder(folder: Path) -> List[Path]:
-    valid_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff')
+    """Return sorted list of valid image paths in the folder."""
+    valid_exts = ('.jpg','.jpeg','.png','.bmp','.tiff')
     image_paths = []
     for f in folder.iterdir():
         if f.is_file() and f.suffix.lower() in valid_exts:
@@ -452,17 +441,14 @@ def load_images_from_folder(folder: Path) -> List[Path]:
     image_paths.sort()
     return image_paths
 
-
-def generate_synthetic_image(device: torch.device, height: int = 256, width: int = 256) -> Tensor:
-    gt_image = torch.ones((height, width, 3), device=device, dtype=torch.float32)
-    gt_image[: height // 2, : width // 2, :] = torch.tensor([1.0, 0.0, 0.0], device=device)
-    gt_image[height // 2 :, width // 2 :, :] = torch.tensor([0.0, 0.0, 1.0], device=device)
-    return gt_image
-
-
-# -----------------------------------------------------------------------------
-#                 MULTI-GPU UTILITY FUNCTIONS (for folder-based tasks)
-# -----------------------------------------------------------------------------
+def generate_synthetic_image(device: torch.device, height=256, width=256) -> Tensor:
+    """Generate a 256x256 synthetic image: half is red, half is blue, rest is white."""
+    img = torch.ones((height, width,3), device=device)
+    # top-left quadrant = red
+    img[:height//2, :width//2,:] = torch.tensor([1.0,0.0,0.0], device=device)
+    # bottom-right quadrant = blue
+    img[height//2:, width//2:,:] = torch.tensor([0.0,0.0,1.0], device=device)
+    return img
 
 def _train_on_image(
     img_path: Path,
@@ -485,7 +471,6 @@ def _train_on_image(
     trainer.train(iterations=iterations, lr=lr, save_imgs=save_imgs, output_pkl=output_pkl)
     trainer.plot_loss(save_path=str(Path(output_pkl).with_suffix('.png')))
     return output_pkl
-
 
 def _experiment_on_image(
     img_path: Path,
@@ -517,9 +502,9 @@ def _experiment_on_image(
 
     return results_for_image
 
-
 def main():
     parser = argparse.ArgumentParser(description="Fitting 2D Gaussians to an Image (single or multiple images)")
+
     subparsers = parser.add_subparsers(dest='command', required=True, help='Sub-command help')
 
     # --- Train subcommand ---
@@ -532,12 +517,11 @@ def main():
     parser_train.add_argument('--image_folder', type=Path, default=None, help='Folder containing multiple images')
     parser_train.add_argument('--iterations', type=int, default=2000, help='Number of training iterations')
     parser_train.add_argument('--lr', type=float, default=0.01, help='Learning rate')
-    parser_train.add_argument('--output_path', type=str, default='fitted_gaussians.pkl',
-                              help='Default PKL path (if single image). Otherwise automatically named for each image.')
+    parser_train.add_argument('--output_path', type=str, default='fitted_gaussians.pkl', help='Path to save PKL')
     parser_train.add_argument('--num_gpus', type=int, default=1, help='Number of GPUs to use')
 
     # --- Experiment subcommand ---
-    parser_experiment = subparsers.add_parser('experiment', help='Run multiple training sessions (grid search) with different parameters.')
+    parser_experiment = subparsers.add_parser('experiment', help='Run multiple training sessions w/ different parameters.')
     parser_experiment.add_argument('--img_path', type=str, default=None, help='Path to a single image')
     parser_experiment.add_argument('--image_folder', type=str, default=None, help='Folder of images to run experiment on')
     parser_experiment.add_argument('--num_points_list', type=int, nargs='+', default=[100, 200, 500, 1000, 2000],
@@ -546,38 +530,34 @@ def main():
                                    help='List of iteration counts to experiment with')
     parser_experiment.add_argument('--lr', type=float, default=0.01, help='Learning rate')
     parser_experiment.add_argument('--save_imgs', action='store_true', help='Save rendered images as GIF')
-    parser_experiment.add_argument('--output_log', type=str, default='experiment_results.csv', help='Path to save experiment results CSV')
-    parser_experiment.add_argument('--auto_plot', action='store_true', help='Automatically generate plots after experiments')
+    parser_experiment.add_argument('--output_log', type=str, default='experiment_results.csv', help='Path to save CSV')
+    parser_experiment.add_argument('--auto_plot', action='store_true', help='Generate plots after experiments')
     parser_experiment.add_argument('--num_gpus', type=int, default=1, help='Number of GPUs to use')
 
     # --- Plot subcommand ---
     parser_plot = subparsers.add_parser('plot', help='Plot results from a CSV file')
-    parser_plot.add_argument('--csv_path', type=str, default='experiment_results.csv', help='Path to the CSV file containing experiment results')
+    parser_plot.add_argument('--csv_path', type=str, default='experiment_results.csv', help='Path to CSV')
 
     args = parser.parse_args()
 
-    # if single GPU or single image, we can run the old code path
-    # but let's handle multiple GPUs in folder-based tasks.
-
+    # Decide which subcommand was called
     if args.command == 'train':
         if args.image_folder is not None:
-            # Train on every image in the folder
+            # Train on every image in folder, optionally using multiple GPUs
             image_paths = load_images_from_folder(args.image_folder)
             if len(image_paths) == 0:
                 print(f"No valid images found in {args.image_folder}")
                 sys.exit(1)
 
-            # Example of creating some output folder logic (customize as you wish):
             output_folder = Path.cwd() / "train_results"
             output_folder.mkdir(parents=True, exist_ok=True)
 
+            # If multiple GPUs, distribute images among them
             if args.num_gpus > 1:
-                # Distribute images across multiple GPUs in parallel
                 futures = []
-                from concurrent.futures import ProcessPoolExecutor
                 with ProcessPoolExecutor(max_workers=args.num_gpus) as executor:
                     for i, img_path in enumerate(image_paths):
-                        gpu_id = i % args.num_gpus  # round-robin assignment
+                        gpu_id = i % args.num_gpus
                         out_name = output_folder / f"{img_path.stem}_fitted_gaussians.pkl"
                         futures.append(
                             executor.submit(
@@ -591,13 +571,12 @@ def main():
                                 gpu_id=gpu_id
                             )
                         )
-                    # wait for all results
                     for f in as_completed(futures):
-                        print(f"Done: {f.result()}")  # pkl path
+                        print(f"Done: {f.result()}")
             else:
                 # Single GPU
                 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-                for img_path in image_paths:
+                for i, img_path in enumerate(image_paths):
                     print(f"[TRAIN single-GPU] Processing {img_path.name}")
                     out_name = output_folder / f"{img_path.stem}_fitted_gaussians.pkl"
                     _train_on_image(
@@ -609,10 +588,9 @@ def main():
                         output_pkl=str(out_name),
                         gpu_id=0
                     )
-
         else:
             # Single image or synthetic
-            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             if args.img_path:
                 gt_image = image_path_to_tensor(Path(args.img_path), device=device)
             else:
@@ -628,9 +606,8 @@ def main():
             trainer.plot_loss(save_path="loss_curve.png")
 
     elif args.command == 'experiment':
-        # We'll store results for eventual CSV writing
-        fieldnames = ["image_name", "num_points", "iterations", "psnr", "lpips", "ssim"]
-
+        # Multiple runs w/ different parameters, logging metrics to CSV
+        fieldnames = ["image_name","num_points","iterations","psnr","lpips","ssim"]
         if args.image_folder is not None:
             folder = Path(args.image_folder)
             image_paths = load_images_from_folder(folder)
@@ -638,20 +615,17 @@ def main():
                 print(f"No valid images found in {folder}")
                 sys.exit(1)
 
-            # Write CSV header
             with open(args.output_log, "w", newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
 
-            aggregated_results = defaultdict(list)
-
+            aggregated = defaultdict(list)
             if args.num_gpus > 1:
-                # Parallel across GPUs
-                all_futures = []
+                futures = []
                 with ProcessPoolExecutor(max_workers=args.num_gpus) as executor:
                     for i, img_path in enumerate(image_paths):
                         gpu_id = i % args.num_gpus
-                        future = executor.submit(
+                        fut = executor.submit(
                             _experiment_on_image,
                             img_path=img_path,
                             num_points_list=args.num_points_list,
@@ -660,26 +634,22 @@ def main():
                             save_imgs=args.save_imgs,
                             gpu_id=gpu_id
                         )
-                        all_futures.append(future)
-
-                    # gather results
-                    for fut in as_completed(all_futures):
+                        futures.append(fut)
+                    for fut in as_completed(futures):
                         results_for_image = fut.result()
-                        # Write partial results to CSV
                         with open(args.output_log, "a", newline='') as f:
                             writer = csv.DictWriter(f, fieldnames=fieldnames)
-                            for (img_name, np_, it_, psnr_val, lpips_val, ssim_val) in results_for_image:
+                            for (name, np_, it_, psnr_val, lpips_val, ssim_val) in results_for_image:
                                 writer.writerow({
-                                    "image_name": img_name,
+                                    "image_name": name,
                                     "num_points": np_,
                                     "iterations": it_,
                                     "psnr": psnr_val,
                                     "lpips": lpips_val,
-                                    "ssim": ssim_val,
+                                    "ssim": ssim_val
                                 })
-                                aggregated_results[(np_, it_)].append((psnr_val, lpips_val, ssim_val))
+                                aggregated[(np_, it_)].append((psnr_val, lpips_val, ssim_val))
             else:
-                # Single GPU
                 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
                 for img_path in image_paths:
                     results_for_image = _experiment_on_image(
@@ -688,40 +658,37 @@ def main():
                         iterations_list=args.iterations_list,
                         lr=args.lr,
                         save_imgs=args.save_imgs,
-                        gpu_id=0  # single GPU
+                        gpu_id=0
                     )
-                    # Write partial results to CSV
                     with open(args.output_log, "a", newline='') as f:
                         writer = csv.DictWriter(f, fieldnames=fieldnames)
-                        for (img_name, np_, it_, psnr_val, lpips_val, ssim_val) in results_for_image:
+                        for (name, np_, it_, psnr_val, lpips_val, ssim_val) in results_for_image:
                             writer.writerow({
-                                "image_name": img_name,
+                                "image_name": name,
                                 "num_points": np_,
                                 "iterations": it_,
                                 "psnr": psnr_val,
                                 "lpips": lpips_val,
-                                "ssim": ssim_val,
+                                "ssim": ssim_val
                             })
-                            aggregated_results[(np_, it_)].append((psnr_val, lpips_val, ssim_val))
+                            aggregated[(np_, it_)].append((psnr_val, lpips_val, ssim_val))
 
-            # After all images, compute average for each (num_points, iters)
-            avg_results_path = Path(args.output_log).parent / ("experiment_results_averaged.csv")
-            with open(avg_results_path, "w", newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(["num_points", "iterations", "psnr_mean", "lpips_mean", "ssim_mean", "count"])
-                for (npoints, iters), vals in aggregated_results.items():
-                    vals_arr = np.array(vals)  # shape [count, 3]
-                    psnr_mean, lpips_mean, ssim_mean = vals_arr.mean(axis=0)
-                    writer.writerow([npoints, iters, psnr_mean, lpips_mean, ssim_mean, len(vals)])
-            print(f"Average results saved to: {avg_results_path}")
+            # Compute average results
+            avg_out = Path(args.output_log).parent / "experiment_results_averaged.csv"
+            with open(avg_out, "w", newline='') as f:
+                w = csv.writer(f)
+                w.writerow(["num_points","iterations","psnr_mean","lpips_mean","ssim_mean","count"])
+                for (npts, iters), vals in aggregated.items():
+                    arr = np.array(vals)
+                    means = arr.mean(axis=0)
+                    w.writerow([npts, iters, means[0], means[1], means[2], len(vals)])
+            print(f"Averaged results saved to {avg_out}")
 
-            # auto plot if requested
             if args.auto_plot:
                 plot_results_from_csv(args.output_log)
-
         else:
             # Single image or synthetic
-            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             if args.img_path:
                 img_path = Path(args.img_path)
                 gt_image = image_path_to_tensor(img_path, device=device)
@@ -730,27 +697,26 @@ def main():
                 gt_image = generate_synthetic_image(device)
                 image_name = "synthetic"
 
-            # Prepare CSV
             with open(args.output_log, "w", newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=["image_name","num_points","iterations","psnr","lpips","ssim"])
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
 
-            for npoints in args.num_points_list:
-                for iters in args.iterations_list:
-                    print(f"[EXPERIMENT single] num_points={npoints}, iterations={iters}")
-                    trainer = SimpleTrainer(gt_image=gt_image, num_points=npoints)
-                    _, _, final_out_img = trainer.train(iterations=iters, lr=args.lr, save_imgs=args.save_imgs)
-                    gt_np = gt_image.detach().cpu().numpy()
-                    psnr_val = calculate_psnr(final_out_img, gt_np, max_val=1.0)
-                    lpips_val = calculate_lpips(final_out_img, gt_np, device=trainer.device)
-                    ssim_val = calculate_ssim(final_out_img, gt_np, device=trainer.device)
+            for np_ in args.num_points_list:
+                for it_ in args.iterations_list:
+                    print(f"[EXPERIMENT single] npoints={np_}, iters={it_}")
+                    trainer = SimpleTrainer(gt_image=gt_image, num_points=np_)
+                    _, _, final_img = trainer.train(iterations=it_, lr=args.lr, save_imgs=args.save_imgs)
+                    gt_np = gt_image.cpu().numpy()
+                    psnr_val = calculate_psnr(final_img, gt_np, max_val=1.0)
+                    lpips_val = calculate_lpips(final_img, gt_np, device=device)
+                    ssim_val = calculate_ssim(final_img, gt_np, device=device)
 
                     with open(args.output_log, "a", newline='') as f:
-                        writer = csv.DictWriter(f, fieldnames=["image_name","num_points","iterations","psnr","lpips","ssim"])
-                        writer.writerow({
+                        w = csv.DictWriter(f, fieldnames=fieldnames)
+                        w.writerow({
                             "image_name": image_name,
-                            "num_points": npoints,
-                            "iterations": iters,
+                            "num_points": np_,
+                            "iterations": it_,
                             "psnr": psnr_val,
                             "lpips": lpips_val,
                             "ssim": ssim_val
@@ -762,11 +728,9 @@ def main():
 
     elif args.command == 'plot':
         plot_results_from_csv(args.csv_path)
-
     else:
         print("Unknown command. Use 'train', 'experiment', or 'plot'.")
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
