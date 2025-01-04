@@ -37,13 +37,40 @@ def calculate_psnr(img: np.ndarray, gt: np.ndarray, max_val: float = 1.0) -> flo
 
 def calculate_lpips(img: np.ndarray, gt: np.ndarray, device: torch.device = torch.device('cpu')) -> float:
     """Calculate LPIPS between img and gt in [0..1], shape [H,W,3]."""
-    loss_fn_vgg = lpips.LPIPS(net='vgg').to(device)
-    # LPIPS expects inputs in [-1, +1]
-    img_t = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(device).float() * 2.0 - 1.0
-    gt_t = torch.from_numpy(gt).permute(2, 0, 1).unsqueeze(0).to(device).float() * 2.0 - 1.0
-    with torch.no_grad():
-        lpips_val = loss_fn_vgg(img_t, gt_t).item()
-    return lpips_val
+    # Clear CUDA cache
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    try:
+        # Initialize model on CPU first
+        loss_fn_vgg = lpips.LPIPS(net='vgg')
+        # Move to specified device only when needed
+        loss_fn_vgg = loss_fn_vgg.to(device)
+        
+        # LPIPS expects inputs in [-1, +1]
+        img_t = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(device).float() * 2.0 - 1.0
+        gt_t = torch.from_numpy(gt).permute(2, 0, 1).unsqueeze(0).to(device).float() * 2.0 - 1.0
+        
+        with torch.no_grad():
+            lpips_val = loss_fn_vgg(img_t, gt_t).item()
+        
+        # Clean up
+        loss_fn_vgg.cpu()
+        del loss_fn_vgg
+        del img_t
+        del gt_t
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        return lpips_val
+        
+    except RuntimeError as e:
+        if "out of memory" in str(e):
+            # If OOM occurs, try on CPU
+            print("Warning: CUDA OOM, calculating LPIPS on CPU")
+            return calculate_lpips(img, gt, device=torch.device('cpu'))
+        else:
+            raise e
 
 def calculate_ssim(img: np.ndarray, gt: np.ndarray, device: torch.device = torch.device('cpu')) -> float:
     """Calculate SSIM between img and gt in [0..1], shape [H,W,3]."""
@@ -181,12 +208,12 @@ class SimpleTrainer:
         with torch.no_grad():
             covs = self._get_covs()
         original_gs = TwoDGaussians(
-            means=self.means.cpu().numpy(),
-            covs=covs.cpu().numpy(),
-            rgb=torch.sigmoid(self.rgbs).cpu().numpy(),
-            alpha=torch.sigmoid(self.opacities).cpu().numpy(),
-            rotations=self.rotations.cpu().numpy(),
-            scales=self.scales.cpu().numpy(),
+            means=self.means.detach().cpu().numpy(),
+            covs=covs.detach().cpu().numpy(),
+            rgb=torch.sigmoid(self.rgbs).detach().cpu().numpy(),
+            alpha=torch.sigmoid(self.opacities).detach().cpu().numpy(),
+            rotations=self.rotations.detach().cpu().numpy(),
+            scales=self.scales.detach().cpu().numpy(),
         )
 
         if self.meta is not None:
@@ -210,10 +237,10 @@ class SimpleTrainer:
                 projected_gs = TwoDGaussians(
                     means=means2d,
                     covs=covs2d,
-                    rgb=torch.sigmoid(self.rgbs).cpu().numpy(),
-                    alpha=torch.sigmoid(self.opacities).cpu().numpy(),
-                    rotations=self.rotations.cpu().numpy(),
-                    scales=self.scales.cpu().numpy(),
+                    rgb=torch.sigmoid(self.rgbs).detach().cpu().numpy(),
+                    alpha=torch.sigmoid(self.opacities).detach().cpu().numpy(),
+                    rotations=self.rotations.detach().cpu().numpy(),
+                    scales=self.scales.detach().cpu().numpy(),
                 )
         else:
             projected_gs = None
@@ -343,9 +370,21 @@ class SimpleTrainer:
     @staticmethod
     def save_gaussians(original_gs: TwoDGaussians, projected_gs: Optional[TwoDGaussians], path: str):
         import pickle
+        # Modified to use the expected keys
         data = {
-            'original': original_gs,
-            'projected': projected_gs
+            'original_gaussians': original_gs,
+            'projected_gaussians': projected_gs,
+            'viewmat': torch.tensor([
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 8.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ]),  # Adding the viewmat used in training
+            'K': torch.tensor([
+                [256, 0, 128],
+                [0, 256, 128],
+                [0, 0, 1]
+            ])  # Adding the camera intrinsics matrix
         }
         with open(path, 'wb') as f:
             pickle.dump(data, f)
@@ -480,25 +519,32 @@ def _experiment_on_image(
     save_imgs: bool,
     gpu_id: int
 ) -> List[Tuple[str,int,int,float,float,float]]:
-    """
-    Worker function for 'experiment' subcommand on a single image using a specific GPU.
-    Returns a list of (image_name, num_points, iterations, psnr, lpips, ssim).
-    """
+    """Worker function for 'experiment' subcommand on a single image using a specific GPU."""
     device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
     print(f"[GPU {gpu_id}] Experiment on {img_path.name} ...")
     gt_image = image_path_to_tensor(img_path, device=device)
+    gt_np = gt_image.cpu().numpy()
 
     results_for_image = []
     for npoints in num_points_list:
         for iters in iterations_list:
+            # Clear CUDA cache before each experiment
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
             print(f"[GPU {gpu_id}] -> {img_path.name}, npoints={npoints}, iters={iters}")
             trainer = SimpleTrainer(gt_image=gt_image, num_points=npoints)
             _, _, final_out_img = trainer.train(iterations=iters, lr=lr, save_imgs=save_imgs)
-            gt_np = gt_image.detach().cpu().numpy()
+            
             psnr_val = calculate_psnr(final_out_img, gt_np, max_val=1.0)
-            lpips_val = calculate_lpips(final_out_img, gt_np, device=trainer.device)
-            ssim_val = calculate_ssim(final_out_img, gt_np, device=trainer.device)
+            lpips_val = calculate_lpips(final_out_img, gt_np, device=device)
+            ssim_val = calculate_ssim(final_out_img, gt_np, device=device)
             results_for_image.append((img_path.name, npoints, iters, psnr_val, lpips_val, ssim_val))
+            
+            # Clean up trainer
+            del trainer
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     return results_for_image
 
