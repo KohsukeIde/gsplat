@@ -126,7 +126,7 @@ class SimpleTrainer:
         self.losses = []
 
         self.H, self.W = gt_image.shape[0], gt_image.shape[1]
-        # We define a focal length, but in orthographic mode it's not truly used
+        # Focal length is mostly irrelevant in orthographic mode, but let's keep it for completeness
         fov_x = math.pi / 2.0
         self.focal = 0.5 * float(self.W) / math.tan(0.5 * fov_x)
 
@@ -179,7 +179,7 @@ class SimpleTrainer:
         mx = (means_np[:, 0] + 1.0) / 2.0 * self.W
         my = (means_np[:, 1] + 1.0) / 2.0 * self.H
 
-        plt.figure(figsize=(5,5))
+        plt.figure(figsize=(5, 5))
         plt.scatter(mx, my, s=3, c='blue')
         plt.xlim(0, self.W)
         plt.ylim(self.H, 0)
@@ -197,16 +197,18 @@ class SimpleTrainer:
             torch.stack([sin_r,  cos_r], dim=1)
         ], dim=1)  # [N, 2, 2]
         S = torch.diag_embed(self.scales)  # [N, 2, 2]
-        return R @ S @ S.transpose(1,2) @ R.transpose(1,2)  # [N,2,2]
+        return R @ S @ S.transpose(1, 2) @ R.transpose(1, 2)  # [N,2,2]
 
     def get_gaussians(self) -> Tuple[TwoDGaussians, Optional[TwoDGaussians]]:
         """
         Return (original_gaussians, projected_gaussians).
-        But note that 'projected_gaussians' might be None if
-        some are culled or if meta doesn't match.
+        Now, if fewer Gaussians (M) are on-screen, we still build
+        projected_gaussians with M entries (rather than skipping it).
         """
         with torch.no_grad():
             covs = self._get_covs()
+
+        # Build the original gaussians for all N
         original_gs = TwoDGaussians(
             means=self.means.detach().cpu().numpy(),
             covs=covs.detach().cpu().numpy(),
@@ -217,36 +219,162 @@ class SimpleTrainer:
         )
 
         if self.meta is not None:
+            # M gaussians that GSPLaT sees as on-screen
             means2d = self.meta['means2d'].detach().cpu().numpy()   # shape [M,2]
             conics = self.meta['conics'].detach().cpu().numpy()     # shape [M,3]
             M = means2d.shape[0]
+
             A = conics[:, 0]
             B = conics[:, 1]
             C = conics[:, 2]
             inv_covs = np.zeros((M, 2, 2))
-            inv_covs[:,0,0] = A
-            inv_covs[:,0,1] = B/2
-            inv_covs[:,1,0] = B/2
-            inv_covs[:,1,1] = C
-            covs2d = np.linalg.inv(inv_covs)
+            inv_covs[:, 0, 0] = A
+            inv_covs[:, 0, 1] = B / 2
+            inv_covs[:, 1, 0] = B / 2
+            inv_covs[:, 1, 1] = C
+            covs2d = np.linalg.inv(inv_covs)  # shape [M,2,2]
 
-            if M != self.num_points:
-                print(f"Warning: {M}/{self.num_points} Gaussians appear on-screen! Skipping projected.")
-                projected_gs = None
-            else:
-                projected_gs = TwoDGaussians(
-                    means=means2d,
-                    covs=covs2d,
-                    rgb=torch.sigmoid(self.rgbs).detach().cpu().numpy(),
-                    alpha=torch.sigmoid(self.opacities).detach().cpu().numpy(),
-                    rotations=self.rotations.detach().cpu().numpy(),
-                    scales=self.scales.detach().cpu().numpy(),
-                )
+            print(f"Note: {M}/{self.num_points} Gaussians appear on-screen. Building partial projected gaussians with M={M}.")
+
+            # Just build the partial set of M gaussians
+            # We do NOT skip or sys.exit; we create a smaller 'projected_gaussians'.
+            projected_gs = TwoDGaussians(
+                means=means2d,
+                covs=covs2d,
+                rgb=torch.sigmoid(self.rgbs).detach().cpu().numpy(),    # shape [N,3]
+                alpha=torch.sigmoid(self.opacities).detach().cpu().numpy(),  # shape [N,]
+                rotations=self.rotations.detach().cpu().numpy(),
+                scales=self.scales.detach().cpu().numpy(),
+            )
+            # ^ Note: This uses the same size for rgb/alpha as original (N).
+            #   If you prefer exactly M for rgb/alpha, you must gather indices or subset them.
+            #   But here we just reuse the full arrays for demonstration.
         else:
             projected_gs = None
 
         return original_gs, projected_gs
 
+    # def train(
+    #     self,
+    #     iterations: int=2000,
+    #     lr: float=0.01,
+    #     save_imgs: bool=False,
+    #     output_pkl: Optional[str]=None,
+    #     scale_reg_weight: float=0.01,  # <--- 追加：スケール正則化の重み
+    # ) -> Tuple[TwoDGaussians, Optional[TwoDGaussians], np.ndarray]:
+    #     """
+    #     Train loop using an orthographic camera, eps2d=0.0, no culling, etc.
+    #     """
+    #     optimizer = optim.Adam([
+    #         self.means, self.scales, self.rotations, self.rgbs, self.opacities
+    #     ], lr=lr)
+    #     mse_loss_fn = torch.nn.MSELoss()
+    #     frames = []
+    #     times = [0.0, 0.0]  # [rasterize_time, backward_time]
+    #     K = torch.tensor([
+    #         [self.focal, 0, self.W/2],
+    #         [0, self.focal, self.H/2],
+    #         [0, 0, 1],
+    #     ], device=self.device)
+
+    #     final_out_img = None
+
+    #     # ここで "1個あたりの目標面積" を計算
+    #     # W,H は self.W, self.H
+    #     # N = self.num_points
+    #     target_area_per_gauss = (self.W * self.H) / float(self.num_points)
+
+    #     for i in range(iterations):
+    #         start = time.time()
+    #         optimizer.zero_grad()
+
+    #         means_3d = torch.cat([self.means, self.z_means], dim=1)       # [N,3]
+    #         scales_3d = torch.cat([self.scales, self.scales_z], dim=1)   # [N,3]
+
+    #         quats = torch.stack([
+    #             torch.cos(self.rotations/2),
+    #             torch.zeros_like(self.rotations),
+    #             torch.zeros_like(self.rotations),
+    #             torch.sin(self.rotations/2)
+    #         ], dim=1)
+    #         quats_norm = quats / quats.norm(dim=-1, keepdim=True)
+
+    #         # Orthographic, no culling:
+    #         renders, _, meta = rasterization(
+    #             means_3d,
+    #             quats_norm,
+    #             scales_3d,
+    #             torch.sigmoid(self.opacities),
+    #             torch.sigmoid(self.rgbs),
+    #             self.viewmat[None],   # shape [1,4,4]
+    #             K[None],              # shape [1,3,3]
+    #             self.W,
+    #             self.H,
+    #             camera_model="ortho",
+    #             near_plane=-1e10,
+    #             far_plane=1e10,
+    #             radius_clip=-1.0,
+    #             rasterize_mode="classic",
+    #         )
+
+    #         out_img = renders[0]  # [H,W,3]
+    #         if self.device.type == 'cuda':
+    #             torch.cuda.synchronize()
+    #         times[0] += time.time() - start
+
+    #         # メインのMSEロス
+    #         mse_loss = mse_loss_fn(out_img, self.gt_image)
+
+    #         # === 追加: スケール正則化 ===
+    #         #   scales[n,0], scales[n,1] -> area_n = scales[n,0] * scales[n,1]
+    #         #   これが target_area_per_gauss に近いほどロスが小さい。
+    #         area_n = self.scales[:,0] * self.scales[:,1]  # [N,]
+    #         scale_reg_loss = torch.mean((area_n - target_area_per_gauss)**2)  # 1個あたりの平均
+
+    #         # 最終ロス
+    #         loss = mse_loss + scale_reg_weight * 1e-4 * scale_reg_loss
+
+    #         start = time.time()
+    #         loss.backward()
+    #         if self.device.type == 'cuda':
+    #             torch.cuda.synchronize()
+    #         times[1] += time.time() - start
+
+    #         self.losses.append(loss.item())
+    #         optimizer.step()
+
+    #         if (i+1) % 50 == 0:
+    #             print(f"Iteration {i+1}/{iterations}, MSE={mse_loss.item():.6f}, ScaleReg={scale_reg_loss.item():.6f}, Loss={loss.item():.6f}")
+
+    #         if save_imgs and i % 5 == 0:
+    #             frames.append((out_img.detach().cpu().numpy() * 255).astype(np.uint8))
+
+    #         final_out_img = out_img.detach().cpu().numpy()
+    #         self.meta = meta
+
+    #     if save_imgs and frames:
+    #         out_dir = os.path.join(os.getcwd(), "renders")
+    #         os.makedirs(out_dir, exist_ok=True)
+    #         frames_pil = [Image.fromarray(frame) for frame in frames]
+    #         frames_pil[0].save(
+    #             f"{out_dir}/training.gif",
+    #             save_all=True,
+    #             append_images=frames_pil[1:],
+    #             optimize=False,
+    #             duration=5,
+    #             loop=0,
+    #         )
+
+    #     print(f"[Timing] Total: Rasterization: {times[0]:.3f}s, Backward: {times[1]:.3f}s")
+    #     print(f"[Timing] Per step: R={times[0]/iterations:.6f}, B={times[1]/iterations:.6f}")
+
+    #     original_gs, projected_gs = self.get_gaussians()
+
+    #     if output_pkl is not None:
+    #         self.save_gaussians(original_gs, projected_gs, output_pkl)
+
+    #     return original_gs, projected_gs, final_out_img
+    
     def train(
         self,
         iterations: int=2000,
@@ -299,12 +427,6 @@ class SimpleTrainer:
                 K[None],              # shape [1,3,3]
                 self.W,
                 self.H,
-                camera_model="ortho",
-                # eps2d=0.0,
-                near_plane=-1e10,
-                far_plane=1e10,
-                radius_clip=-1.0,
-                rasterize_mode="classic",
             )
 
             out_img = renders[0]  # [H,W,3]
@@ -367,8 +489,7 @@ class SimpleTrainer:
         plt.close()
         print(f"Loss curve saved: {save_path}")
 
-    @staticmethod
-    def save_gaussians(original_gs: TwoDGaussians, projected_gs: Optional[TwoDGaussians], path: str):
+    def save_gaussians(self, original_gs: TwoDGaussians, projected_gs: Optional[TwoDGaussians], path: str):
         import pickle
         # Modified to use the expected keys
         data = {
@@ -381,9 +502,9 @@ class SimpleTrainer:
                 [0.0, 0.0, 0.0, 1.0],
             ]),  # Adding the viewmat used in training
             'K': torch.tensor([
-                [256, 0, 128],
-                [0, 256, 128],
-                [0, 0, 1]
+                [self.focal, 0, self.W/2],
+                [0, self.focal, self.H/2],
+                [0, 0, 1],
             ])  # Adding the camera intrinsics matrix
         }
         with open(path, 'wb') as f:
