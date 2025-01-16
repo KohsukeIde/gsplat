@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 import math
 import os
 import sys
@@ -5,7 +7,6 @@ import time
 from pathlib import Path
 from typing import Optional
 import pickle
-
 
 import numpy as np
 import torch
@@ -15,7 +16,8 @@ import matplotlib.pyplot as plt
 from torch import Tensor, optim
 
 from gsplat import rasterization
-from twodgs import TwoDGaussians  
+from twodgs import TwoDGaussians
+
 
 class SimpleTrainer:
     """Trains 2D gaussians to fit an image."""
@@ -55,8 +57,6 @@ class SimpleTrainer:
 
         self.meta = None
 
-  
-
         self.viewmat = torch.tensor(
             [
                 [1.0, 0.0, 0.0, 0.0],
@@ -65,7 +65,7 @@ class SimpleTrainer:
                 [0.0, 0.0, 0.0, 1.0],
             ],
             device=self.device,
-        ) # [4, 4]
+        )  # [4, 4]
         self.means.requires_grad = True
         self.scales.requires_grad = True
         self.rotations.requires_grad = True
@@ -92,10 +92,10 @@ class SimpleTrainer:
     #         covs=covs.detach().cpu().numpy(),
     #         rgb=torch.sigmoid(self.rgbs).detach().cpu().numpy(),
     #         alpha=torch.sigmoid(self.opacities).detach().cpu().numpy(),
-    #         rotations=self.rotations.detach().cpu().numpy(),  
-    #         scales=self.scales.detach().cpu().numpy()         
+    #         rotations=self.rotations.detach().cpu().numpy(),
+    #         scales=self.scales.detach().cpu().numpy()
     #     )
-    
+
     def get_gaussians(self) -> tuple:
         # 元のガウス分布を取得
         with torch.no_grad():
@@ -146,7 +146,6 @@ class SimpleTrainer:
 
         return original_gaussians, projected_gaussians
 
-            
     # def save_gaussians(self, gaussians: TwoDGaussians, file_path: str):
     #     print(f"Saving means: {gaussians.means[:5]}")
     #     print(f"Saving covs: {gaussians.covs[:5]}")
@@ -164,7 +163,7 @@ class SimpleTrainer:
     #     with open(file_path, 'wb') as f:
     #         pickle.dump(data, f)
     #     print(f"Saved gaussians and camera parameters to {file_path}")
-    
+
     def save_gaussians(self, original_gaussians: TwoDGaussians, projected_gaussians: TwoDGaussians, file_path: str):
         print(f"Saving original means: {original_gaussians.means[:5]}")
         print(f"Saving original covs: {original_gaussians.covs[:5]}")
@@ -186,7 +185,6 @@ class SimpleTrainer:
             pickle.dump(data, f)
         print(f"Saved gaussians and camera parameters to {file_path}")
 
-
     def train(
         self,
         iterations: int = 2000,
@@ -194,16 +192,16 @@ class SimpleTrainer:
         save_imgs: bool = False,
     ):
         optimizer = optim.Adam([
-            self.means, self.scales, self.rotations, self.rgbs, self.opacities, 
-            ], lr=lr)
+            self.means, self.scales, self.rotations, self.rgbs, self.opacities,
+        ], lr=lr)
         mse_loss = torch.nn.MSELoss()
         frames = []
         times = [0] * 2  # rasterization, backward
         K = torch.tensor([
-                    [self.focal, 0, self.W / 2],
-                    [0, self.focal, self.H / 2],
-                    [0, 0, 1],
-                ], device=self.device)  # [3, 3]
+            [self.focal, 0, self.W / 2],
+            [0, self.focal, self.H / 2],
+            [0, 0, 1],
+        ], device=self.device)  # [3, 3]
 
         for iter in range(iterations):
             start = time.time()
@@ -223,17 +221,11 @@ class SimpleTrainer:
             quats_normalized = quats / quats.norm(dim=-1, keepdim=True)  # [N, 4]
 
             if iter == 0:
-                print(f"means_3d shape: {means_3d.shape}")                    # [N, 3]
-                print(f"quats_normalized shape: {quats_normalized.shape}")    # [N, 4]
-                print(f"scales_3d shape: {scales_3d.shape}")                  # [N, 3]
-                print(f"K shape: {K.shape}")                              # [3, 3]
-                print(f"viewmat shape: {self.viewmat.shape}")                  # [4, 4]
-            
-            # print(f"{self.means=}")
-            # print(f"{self.z_means=}")
-            # print(f"{self.scales=}")
-            # print(f"{self.scales_z=}")
-
+                print(f"means_3d shape: {means_3d.shape}")  # [N, 3]
+                print(f"quats_normalized shape: {quats_normalized.shape}")  # [N, 4]
+                print(f"scales_3d shape: {scales_3d.shape}")  # [N, 3]
+                print(f"K shape: {K.shape}")  # [3, 3]
+                print(f"viewmat shape: {self.viewmat.shape}")  # [4, 4]
 
             renders, _, meta = rasterization(
                 means_3d,                # [N, 3]
@@ -241,23 +233,27 @@ class SimpleTrainer:
                 scales_3d,               # [N, 3]
                 torch.sigmoid(self.opacities),  # [N]
                 torch.sigmoid(self.rgbs),       # [N, 3]
-                self.viewmat[None],         # [1, 4, 4]
-                K[None],                  # [1, 3, 3]
+                self.viewmat[None],      # [1, 4, 4]
+                K[None],                 # [1, 3, 3]
                 self.W,
                 self.H,
             )
-            
-            
+
             out_img = renders[0]
+
+            # === ここで [0, 1] にクリッピングを追加 ===
+            out_img = torch.clamp(out_img, 0.0, 1.0)
+
             torch.cuda.synchronize()
             times[0] += time.time() - start
+
             loss = mse_loss(out_img, self.gt_image)
             optimizer.zero_grad()
             start = time.time()
             loss.backward()
             torch.cuda.synchronize()
             times[1] += time.time() - start
-            
+
             self.losses.append(loss.item())
 
             # 勾配の確認（first 5iter）
@@ -271,17 +267,18 @@ class SimpleTrainer:
                 print(f"z_means grad mean: {self.z_means.grad.abs().mean().item() if self.z_means.grad is not None else 'None'}")
                 print(f"scales_z grad mean: {self.scales_z.grad.abs().mean().item() if self.scales_z.grad is not None else 'None'}")
 
-                # sys.exit()
-
             optimizer.step()
             print(f"Iteration {iter + 1}/{iterations}, Loss: {loss.item()}")
-            
+
             if iter % 100 == 0:
                 print(f"Rendered image mean: {out_img.mean().item()}, std: {out_img.std().item()}")
 
             if save_imgs and iter % 5 == 0:
+                # クリップ済み out_img でフレームを作成
                 frames.append((out_img.detach().cpu().numpy() * 255).astype(np.uint8))
- 
+
+            self.meta = meta
+
         if save_imgs and len(frames) > 0:
             frames = [Image.fromarray(frame) for frame in frames]
             out_dir = os.path.join(os.getcwd(), "renders")
@@ -299,29 +296,24 @@ class SimpleTrainer:
         print(
             f"Per step(s):\nRasterization: {times[0]/iterations:.5f}, Backward: {times[1]/iterations:.5f}"
         )
-        # print(f"Final means: {self.means}")
-        # print(f"Final scales: {self.scales}")
-        # print(f"Final rotations: {self.rotations}")
-        # print(f"Final rgbs: {self.rgbs}")
-        # print(f"Final opacities: {self.opacities}")
         self.meta = meta
         original_gaussians, projected_gaussians = self.get_gaussians()
 
         self.save_gaussians(original_gaussians, projected_gaussians, 'fitted_gaussians.pkl')
-
         return original_gaussians, projected_gaussians
-        
+
     def plot_loss(self, save_path: str = 'loss_curve.png'):
         plt.figure(figsize=(10, 6))
         plt.plot(self.losses)
         plt.title('Training Loss Over Time')
         plt.xlabel('Iteration')
         plt.ylabel('Loss')
-        plt.yscale('log')  # Use log scale for y-axis
+        plt.yscale('log')
         plt.grid(True)
         plt.savefig(save_path)
         plt.close()
         print(f"Loss curve saved to {save_path}")
+
 
 def image_path_to_tensor(image_path: Path):
     import torchvision.transforms as transforms
@@ -331,36 +323,35 @@ def image_path_to_tensor(image_path: Path):
     img_tensor = transform(img).permute(1, 2, 0)[..., :3]
     return img_tensor
 
+
 def main(
     height: int = 256,
     width: int = 256,
-    num_points: int = 200,
+    num_points: int = 16,
     save_imgs: bool = True,
     img_path: Optional[Path] = None,
-    iterations: int = 2000,
+    iterations: int = 5000,
     lr: float = 0.01,
     output_path: str = 'fitted_gaussians.pkl',
 ) -> None:
     if img_path:
         gt_image = image_path_to_tensor(img_path)
     else:
-        gt_image = torch.ones((height, width, 3), device=torch.device("cuda" if torch.cuda.is_available() else "cpu")) * 1.0 # make top left and bottom right red, blue
-        # make top left and bottom right red, blue
+        gt_image = torch.ones((height, width, 3), device=torch.device("cuda" if torch.cuda.is_available() else "cpu")) * 1.0
         gt_image[: height // 2, : width // 2, :] = torch.tensor([1.0, 0.0, 0.0], device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         gt_image[height // 2 :, width // 2 :, :] = torch.tensor([0.0, 0.0, 1.0], device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
     trainer = SimpleTrainer(gt_image=gt_image, num_points=num_points)
     original_gaussians, projected_gaussians = trainer.train(
-            iterations=iterations,
-            lr=lr,
-            save_imgs=save_imgs,
-        )
+        iterations=iterations,
+        lr=lr,
+        save_imgs=save_imgs,
+    )
 
     print(f"Fitted {original_gaussians.k} Gaussians")
-    # ガウス分布はすでに保存されているので、再度保存する必要はありません
 
     trainer.plot_loss(save_path="loss_curve.png")
 
+
 if __name__ == "__main__":
     tyro.cli(main)
-
