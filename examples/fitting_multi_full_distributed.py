@@ -202,13 +202,11 @@ class SimpleTrainer:
     def get_gaussians(self) -> Tuple[TwoDGaussians, Optional[TwoDGaussians]]:
         """
         Return (original_gaussians, projected_gaussians).
-        Now, if fewer Gaussians (M) are on-screen, we still build
-        projected_gaussians with M entries (rather than skipping it).
+        If fewer Gaussians are on-screen, subset the attributes for the projected_gaussians.
         """
         with torch.no_grad():
             covs = self._get_covs()
 
-        # Build the original gaussians for all N
         original_gs = TwoDGaussians(
             means=self.means.detach().cpu().numpy(),
             covs=covs.detach().cpu().numpy(),
@@ -219,9 +217,9 @@ class SimpleTrainer:
         )
 
         if self.meta is not None:
-            # M gaussians that GSPLaT sees as on-screen
-            means2d = self.meta['means2d'].detach().cpu().numpy()   # shape [M,2]
-            conics = self.meta['conics'].detach().cpu().numpy()     # shape [M,3]
+            # Subset attributes for the projected Gaussians
+            means2d = self.meta['means2d'].detach().cpu().numpy()   # [M,2]
+            conics = self.meta['conics'].detach().cpu().numpy()     # [M,3]
             M = means2d.shape[0]
 
             A = conics[:, 0]
@@ -232,27 +230,24 @@ class SimpleTrainer:
             inv_covs[:, 0, 1] = B / 2
             inv_covs[:, 1, 0] = B / 2
             inv_covs[:, 1, 1] = C
-            covs2d = np.linalg.inv(inv_covs)  # shape [M,2,2]
+            covs2d = np.linalg.inv(inv_covs)  # [M,2,2]
 
-            print(f"Note: {M}/{self.num_points} Gaussians appear on-screen. Building partial projected gaussians with M={M}.")
+            print(f"Projected: {M}/{self.num_points} Gaussians appear on-screen.")
 
-            # Just build the partial set of M gaussians
-            # We do NOT skip or sys.exit; we create a smaller 'projected_gaussians'.
+            # Subset rgb, alpha, rotations, scales to match projected Gaussians
             projected_gs = TwoDGaussians(
-                means=means2d,
-                covs=covs2d,
-                rgb=torch.sigmoid(self.rgbs).detach().cpu().numpy(),    # shape [N,3]
-                alpha=torch.sigmoid(self.opacities).detach().cpu().numpy(),  # shape [N,]
-                rotations=self.rotations.detach().cpu().numpy(),
-                scales=self.scales.detach().cpu().numpy(),
+                means=means2d,                 # [M,2]
+                covs=covs2d,                   # [M,2,2]
+                rgb=torch.sigmoid(self.rgbs).detach().cpu().numpy()[:M],  # Subset [M,3]
+                alpha=torch.sigmoid(self.opacities).detach().cpu().numpy()[:M],  # Subset [M]
+                rotations=self.rotations.detach().cpu().numpy()[:M],  # Subset [M]
+                scales=self.scales.detach().cpu().numpy()[:M],        # Subset [M,2]
             )
-            # ^ Note: This uses the same size for rgb/alpha as original (N).
-            #   If you prefer exactly M for rgb/alpha, you must gather indices or subset them.
-            #   But here we just reuse the full arrays for demonstration.
         else:
             projected_gs = None
 
         return original_gs, projected_gs
+
 
     # def train(
     #     self,
@@ -377,13 +372,17 @@ class SimpleTrainer:
     
     def train(
         self,
-        iterations: int=2000,
-        lr: float=0.01,
-        save_imgs: bool=False,
-        output_pkl: Optional[str]=None
-    ) -> Tuple[TwoDGaussians, Optional[TwoDGaussians], np.ndarray]:
+        max_iterations: int = 40000,  # Train to max iterations
+        checkpoint_iterations: List[int] = [5000, 10000, 20000, 30000],  # Log metrics at these steps
+        lr: float = 0.01,
+        save_imgs: bool = False,
+        output_pkl: Optional[str] = None,
+        gt_np: Optional[np.ndarray] = None,  # Ground truth in NumPy for metrics
+        device: torch.device = torch.device('cpu'),  # Device for metrics calculation
+    ) -> List[dict]:
         """
-        Train loop using an orthographic camera, eps2d=0.0, no culling, etc.
+        Train loop with intermediate metrics logging.
+        Logs PSNR, LPIPS, and SSIM at checkpoint iterations.
         """
         optimizer = optim.Adam([
             self.means, self.scales, self.rotations, self.rgbs, self.opacities
@@ -392,49 +391,48 @@ class SimpleTrainer:
         frames = []
         times = [0.0, 0.0]  # [rasterize_time, backward_time]
         K = torch.tensor([
-            [self.focal, 0, self.W/2],
-            [0, self.focal, self.H/2],
+            [self.focal, 0, self.W / 2],
+            [0, self.focal, self.H / 2],
             [0, 0, 1],
         ], device=self.device)
 
         final_out_img = None
+        results = []  # List of metrics for each checkpoint
 
-        for i in range(iterations):
+        for i in range(max_iterations):
             start = time.time()
             optimizer.zero_grad()
 
-            means_3d = torch.cat([self.means, self.z_means], dim=1)       # [N,3]
-            scales_3d = torch.cat([self.scales, self.scales_z], dim=1)   # [N,3]
+            means_3d = torch.cat([self.means, self.z_means], dim=1)
+            scales_3d = torch.cat([self.scales, self.scales_z], dim=1)
 
             quats = torch.stack([
-                torch.cos(self.rotations/2),
+                torch.cos(self.rotations / 2),
                 torch.zeros_like(self.rotations),
                 torch.zeros_like(self.rotations),
-                torch.sin(self.rotations/2)
+                torch.sin(self.rotations / 2)
             ], dim=1)
             quats_norm = quats / quats.norm(dim=-1, keepdim=True)
 
-            # Orthographic, no culling:
-            #   camera_model="ortho", eps2d=0.0, near_plane=-1e10,
-            #   far_plane=1e10, radius_clip=-1.0
             renders, _, meta = rasterization(
                 means_3d,
                 quats_norm,
                 scales_3d,
                 torch.sigmoid(self.opacities),
                 torch.sigmoid(self.rgbs),
-                self.viewmat[None],   # shape [1,4,4]
-                K[None],              # shape [1,3,3]
+                self.viewmat[None],
+                K[None],
                 self.W,
                 self.H,
             )
 
-            out_img = renders[0]  # [H,W,3]
+            out_img = renders[0]
             if self.device.type == 'cuda':
                 torch.cuda.synchronize()
             times[0] += time.time() - start
 
             loss = mse_loss_fn(out_img, self.gt_image)
+
             start = time.time()
             loss.backward()
             if self.device.type == 'cuda':
@@ -444,15 +442,26 @@ class SimpleTrainer:
             self.losses.append(loss.item())
             optimizer.step()
 
-            if (i+1) % 50 == 0:
-                print(f"Iteration {i+1}/{iterations}, Loss: {loss.item():.6f}")
+            if (i + 1) in checkpoint_iterations:
+                print(f"Checkpoint at Iteration {i + 1}/{max_iterations}")
+                final_out_img = out_img.detach().cpu().numpy()
+                psnr_val = calculate_psnr(final_out_img, gt_np, max_val=1.0)
+                lpips_val = calculate_lpips(final_out_img, gt_np, device=device)
+                ssim_val = calculate_ssim(final_out_img, gt_np, device=device)
+                results.append({
+                    "iteration": i + 1,
+                    "psnr": psnr_val,
+                    "lpips": lpips_val,
+                    "ssim": ssim_val,
+                })
+                print(f"PSNR: {psnr_val:.4f}, LPIPS: {lpips_val:.4f}, SSIM: {ssim_val:.4f}")
 
-            if save_imgs and i % 5 == 0:
+            if save_imgs and (i + 1) % 5 == 0:
                 frames.append((out_img.detach().cpu().numpy() * 255).astype(np.uint8))
 
-            final_out_img = out_img.detach().cpu().numpy()
             self.meta = meta
 
+        # Optionally save final GIF
         if save_imgs and frames:
             out_dir = os.path.join(os.getcwd(), "renders")
             os.makedirs(out_dir, exist_ok=True)
@@ -467,14 +476,16 @@ class SimpleTrainer:
             )
 
         print(f"[Timing] Total: Rasterization: {times[0]:.3f}s, Backward: {times[1]:.3f}s")
-        print(f"[Timing] Per step: R={times[0]/iterations:.6f}, B={times[1]/iterations:.6f}")
+        print(f"[Timing] Per step: R={times[0]/max_iterations:.6f}, B={times[1]/max_iterations:.6f}")
 
+        # Save final Gaussians
         original_gs, projected_gs = self.get_gaussians()
 
         if output_pkl is not None:
             self.save_gaussians(original_gs, projected_gs, output_pkl)
 
-        return original_gs, projected_gs, final_out_img
+        return results  # List of metrics for all checkpoints
+
 
     def plot_loss(self, save_path='loss_curve.png'):
         plt.figure(figsize=(8,5))
@@ -626,9 +637,18 @@ def _train_on_image(
     device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
     print(f"[GPU {gpu_id}] Training on {img_path.name} ...")
     gt_image = image_path_to_tensor(img_path, device=device)
+    gt_np = gt_image.cpu().numpy()
 
     trainer = SimpleTrainer(gt_image=gt_image, num_points=num_points)
-    trainer.train(iterations=iterations, lr=lr, save_imgs=save_imgs, output_pkl=output_pkl)
+    trainer.train(
+        max_iterations=iterations,
+        checkpoint_iterations=[iterations],
+        lr=lr,
+        save_imgs=save_imgs,
+        output_pkl=output_pkl,
+        gt_np=gt_np,
+        device=device
+    )
     trainer.plot_loss(save_path=str(Path(output_pkl).with_suffix('.png')))
     return output_pkl
 
@@ -639,35 +659,53 @@ def _experiment_on_image(
     lr: float,
     save_imgs: bool,
     gpu_id: int
-) -> List[Tuple[str,int,int,float,float,float]]:
-    """Worker function for 'experiment' subcommand on a single image using a specific GPU."""
+) -> List[dict]:
+    """
+    Train once for each num_points up to max(iterations_list). For each trainer.run(...),
+    we capture the checkpoint metrics that includes iteration, psnr, lpips, ssim.
+    Then we store them in results_for_image with the needed fields for CSV.
+    """
     device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
     print(f"[GPU {gpu_id}] Experiment on {img_path.name} ...")
+
     gt_image = image_path_to_tensor(img_path, device=device)
     gt_np = gt_image.cpu().numpy()
 
     results_for_image = []
+
+    # For each npoints, run a single training up to max(iterations_list).
+    # The train function uses "checkpoint_iterations=iterations_list" to log at each checkpoint
     for npoints in num_points_list:
-        for iters in iterations_list:
-            # Clear CUDA cache before each experiment
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                
-            print(f"[GPU {gpu_id}] -> {img_path.name}, npoints={npoints}, iters={iters}")
-            trainer = SimpleTrainer(gt_image=gt_image, num_points=npoints)
-            _, _, final_out_img = trainer.train(iterations=iters, lr=lr, save_imgs=save_imgs)
-            
-            psnr_val = calculate_psnr(final_out_img, gt_np, max_val=1.0)
-            lpips_val = calculate_lpips(final_out_img, gt_np, device=device)
-            ssim_val = calculate_ssim(final_out_img, gt_np, device=device)
-            results_for_image.append((img_path.name, npoints, iters, psnr_val, lpips_val, ssim_val))
-            
-            # Clean up trainer
-            del trainer
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        print(f"[GPU {gpu_id}] -> {img_path.name}, npoints={npoints}")
+        trainer = SimpleTrainer(gt_image=gt_image, num_points=npoints)
+
+        # Train until the maximum iteration
+        all_metrics = trainer.train(
+            max_iterations=max(iterations_list),
+            checkpoint_iterations=iterations_list,
+            lr=lr,
+            save_imgs=save_imgs,
+            gt_np=gt_np,
+            device=device,
+        )
+
+        # all_metrics is a list of dictionaries: 
+        # [{"iteration": i, "psnr": p, "lpips": l, "ssim": s}, ...]
+        for metrics in all_metrics:
+            # Gather them into the results_for_image structure
+            results_for_image.append({
+                "image_name": img_path.name,
+                "num_points": npoints,
+                "iterations": metrics["iteration"],  # iteration from the checkpoint
+                "psnr": metrics["psnr"],
+                "lpips": metrics["lpips"],
+                "ssim": metrics["ssim"],
+            })
 
     return results_for_image
+
+
+
 
 def main():
     parser = argparse.ArgumentParser(description="Fitting 2D Gaussians to an Image (single or multiple images)")
@@ -773,8 +811,12 @@ def main():
             trainer.plot_loss(save_path="loss_curve.png")
 
     elif args.command == 'experiment':
-        # Multiple runs w/ different parameters, logging metrics to CSV
-        fieldnames = ["image_name","num_points","iterations","psnr","lpips","ssim"]
+        # Define the fieldnames for CSV
+        fieldnames = ["image_name", "num_points", "iterations", "psnr", "lpips", "ssim"]
+
+        # Initialize aggregated dictionary
+        aggregated = defaultdict(list)
+
         if args.image_folder is not None:
             folder = Path(args.image_folder)
             image_paths = load_images_from_folder(folder)
@@ -786,9 +828,8 @@ def main():
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
 
-            aggregated = defaultdict(list)
+            futures = []
             if args.num_gpus > 1:
-                futures = []
                 with ProcessPoolExecutor(max_workers=args.num_gpus) as executor:
                     for i, img_path in enumerate(image_paths):
                         gpu_id = i % args.num_gpus
@@ -806,16 +847,30 @@ def main():
                         results_for_image = fut.result()
                         with open(args.output_log, "a", newline='') as f:
                             writer = csv.DictWriter(f, fieldnames=fieldnames)
-                            for (name, np_, it_, psnr_val, lpips_val, ssim_val) in results_for_image:
-                                writer.writerow({
-                                    "image_name": name,
-                                    "num_points": np_,
-                                    "iterations": it_,
-                                    "psnr": psnr_val,
-                                    "lpips": lpips_val,
-                                    "ssim": ssim_val
-                                })
-                                aggregated[(np_, it_)].append((psnr_val, lpips_val, ssim_val))
+                            for result in results_for_image:
+                                try:
+                                    # Convert metrics to float
+                                    psnr_val = float(result["psnr"])
+                                    lpips_val = float(result["lpips"])
+                                    ssim_val = float(result["ssim"])
+
+                                    # Write row to CSV
+                                    writer.writerow({
+                                        "image_name": result["image_name"],
+                                        "num_points": result["num_points"],
+                                        "iterations": result["iterations"],
+                                        "psnr": psnr_val,
+                                        "lpips": lpips_val,
+                                        "ssim": ssim_val
+                                    })
+
+                                    # Append to aggregated for averaging
+                                    aggregated[(result["num_points"], result["iterations"])].append(
+                                        (psnr_val, lpips_val, ssim_val)
+                                    )
+                                except ValueError as e:
+                                    print(f"Error processing result {result}: {e}")
+                                    continue  # Skip invalid entries
             else:
                 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
                 for img_path in image_paths:
@@ -829,26 +884,43 @@ def main():
                     )
                     with open(args.output_log, "a", newline='') as f:
                         writer = csv.DictWriter(f, fieldnames=fieldnames)
-                        for (name, np_, it_, psnr_val, lpips_val, ssim_val) in results_for_image:
-                            writer.writerow({
-                                "image_name": name,
-                                "num_points": np_,
-                                "iterations": it_,
-                                "psnr": psnr_val,
-                                "lpips": lpips_val,
-                                "ssim": ssim_val
-                            })
-                            aggregated[(np_, it_)].append((psnr_val, lpips_val, ssim_val))
+                        for result in results_for_image:
+                            try:
+                                # Convert metrics to float
+                                psnr_val = float(result["psnr"])
+                                lpips_val = float(result["lpips"])
+                                ssim_val = float(result["ssim"])
+
+                                # Write row to CSV
+                                writer.writerow({
+                                    "image_name": result["image_name"],
+                                    "num_points": result["num_points"],
+                                    "iterations": result["iterations"],
+                                    "psnr": psnr_val,
+                                    "lpips": lpips_val,
+                                    "ssim": ssim_val
+                                })
+
+                                # Append to aggregated for averaging
+                                aggregated[(result["num_points"], result["iterations"])].append(
+                                    (psnr_val, lpips_val, ssim_val)
+                                )
+                            except ValueError as e:
+                                print(f"Error processing result {result}: {e}")
+                                continue  # Skip invalid entries
 
             # Compute average results
             avg_out = Path(args.output_log).parent / "experiment_results_averaged.csv"
             with open(avg_out, "w", newline='') as f:
                 w = csv.writer(f)
-                w.writerow(["num_points","iterations","psnr_mean","lpips_mean","ssim_mean","count"])
+                w.writerow(["num_points", "iterations", "psnr_mean", "lpips_mean", "ssim_mean", "count"])
                 for (npts, iters), vals in aggregated.items():
-                    arr = np.array(vals)
-                    means = arr.mean(axis=0)
+                    if not vals:
+                        continue  # Skip if no valid data
+                    vals_array = np.array(vals)
+                    means = vals_array.mean(axis=0)
                     w.writerow([npts, iters, means[0], means[1], means[2], len(vals)])
+
             print(f"Averaged results saved to {avg_out}")
 
             if args.auto_plot:
