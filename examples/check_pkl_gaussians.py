@@ -11,13 +11,20 @@ from matplotlib.patches import Ellipse
 import matplotlib.pyplot as plt
 
 def load_gaussians(pickle_path: str, device: torch.device) -> tuple:
-    with open(pickle_path, 'rb') as f:
-        data = pickle.load(f)
-        original_gaussians = data["original_gaussians"]
-        projected_gaussians = data["projected_gaussians"]
-        viewmat = torch.tensor(data["viewmat"], dtype=torch.float32, device=device)
-        K = torch.tensor(data["K"], dtype=torch.float32, device=device)
-    return original_gaussians, projected_gaussians, viewmat, K
+    try:
+        with open(pickle_path, 'rb') as f:
+            data = pickle.load(f)
+            original_gaussians = data["original_gaussians"]
+            projected_gaussians = data["projected_gaussians"]
+            viewmat = torch.tensor(data["viewmat"], dtype=torch.float32, device=device)
+            K = torch.tensor(data["K"], dtype=torch.float32, device=device)
+        return original_gaussians, projected_gaussians, viewmat, K
+    except Exception as e:
+        print(f"Error loading pickle file: {e}")
+        print(f"File path: {pickle_path}")
+        print(f"File exists: {os.path.exists(pickle_path)}")
+        print(f"File size: {os.path.getsize(pickle_path) if os.path.exists(pickle_path) else 'N/A'} bytes")
+        raise
 
 def draw_ellipse(ax, mean, cov, n_std=2.0, edgecolor='red'):
     """
@@ -119,7 +126,7 @@ def render_gaussians(
 
         # 画像を保存するためにFigureをCanvasから取得
         fig.canvas.draw()
-        rendered_with_ellipses = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+        rendered_with_ellipses = np.asarray(fig.canvas.buffer_rgba())[:, :, :3]
         rendered_with_ellipses = rendered_with_ellipses.reshape((int(fig.bbox.bounds[3]), int(fig.bbox.bounds[2]), 3))
 
         plt.close(fig)
