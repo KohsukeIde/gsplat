@@ -5,20 +5,16 @@ import os
 import math
 import time
 import numpy as np
+import pickle
 from pathlib import Path
 from typing import Optional, List, Tuple
 import torch
 
-# 2Dガウシアン可視化/操作
-from twodgs import TwoDGaussians
-# gsplat の rasterization を利用
 from gsplat import rasterization
-
-# 追加メトリクス (LPIPSは使わないので除去)
+from twodgs import TwoDGaussians
 from pytorch_msssim import ssim as ssim_fn
-
-# 画像/GIF 出力
 from PIL import Image
+
 
 def calculate_psnr(img: np.ndarray, gt: np.ndarray, max_val: float = 1.0) -> float:
     """Calculate PSNR between img and gt."""
@@ -55,6 +51,10 @@ def rgba_path_to_tensor(image_path: Path, device: torch.device=None) -> Tuple[to
     if device is not None:
         rgb   = rgb.to(device)
         alpha = alpha.to(device)
+
+    if alpha == None:
+        print("where is alpha")
+        sys.exit()
     return rgb, alpha
 
 def load_images_from_folder(folder: Path) -> List[Path]:
@@ -66,6 +66,7 @@ def load_images_from_folder(folder: Path) -> List[Path]:
             image_paths.append(f)
     image_paths.sort()
     return image_paths
+
 
 class SimpleTrainer:
     """
@@ -173,6 +174,88 @@ class SimpleTrainer:
         self.opacities.requires_grad = True
         self.viewmat.requires_grad   = False
 
+    def _get_covs(self) -> torch.Tensor:
+        """(scales, rotations) から 2x2 の共分散行列を計算。"""
+        cos_r = torch.cos(self.rotations)
+        sin_r = torch.sin(self.rotations)
+        R = torch.stack([
+            torch.stack([cos_r, -sin_r], dim=1),
+            torch.stack([sin_r,  cos_r], dim=1)
+        ], dim=1)  # [N, 2, 2]
+        S = torch.diag_embed(self.scales)  # [N, 2, 2]
+        return R @ S @ S.transpose(1, 2) @ R.transpose(1, 2)  # [N,2,2]
+
+    def get_gaussians(self) -> Tuple[TwoDGaussians, Optional[TwoDGaussians]]:
+        """
+        original_gaussians, projected_gaussians のタプルを返す。
+        projected_gaussians は rasterization のメタ情報があれば計算。
+        """
+        with torch.no_grad():
+            covs = self._get_covs()
+        original_gaussians = TwoDGaussians(
+            means=self.means.detach().cpu().numpy(),
+            covs=covs.detach().cpu().numpy(),
+            rgb=torch.sigmoid(self.rgbs).detach().cpu().numpy(),
+            alpha=torch.sigmoid(self.opacities).detach().cpu().numpy(),
+            rotations=self.rotations.detach().cpu().numpy(),
+            scales=self.scales.detach().cpu().numpy(),
+        )
+
+        if self.meta is not None:
+            means2d = self.meta['means2d'].detach().cpu().numpy()  # [M,2]
+            conics  = self.meta['conics'].detach().cpu().numpy()   # [M,3]
+            # conic(A,B,C) -> 2x2共分散へ
+            A = conics[:,0]
+            B = conics[:,1]
+            C = conics[:,2]
+            M = means2d.shape[0]
+            inv_covs = np.zeros((M,2,2))
+            inv_covs[:,0,0] = A
+            inv_covs[:,0,1] = B/2
+            inv_covs[:,1,0] = B/2
+            inv_covs[:,1,1] = C
+            covs2d = np.linalg.inv(inv_covs)
+
+            # RGBやalphaは単純に先頭M個を切り出す想定 (もしくは全Nを使うなら要注意)
+            rgb_ = torch.sigmoid(self.rgbs).detach().cpu().numpy()[:M]
+            alpha_ = torch.sigmoid(self.opacities).detach().cpu().numpy()[:M]
+
+            projected_gaussians = TwoDGaussians(
+                means=means2d,
+                covs=covs2d,
+                rgb=rgb_,
+                alpha=alpha_,
+                rotations=self.rotations.detach().cpu().numpy()[:M],
+                scales=self.scales.detach().cpu().numpy()[:M],
+            )
+        else:
+            projected_gaussians = None
+
+        return original_gaussians, projected_gaussians
+
+    def save_gaussians(
+        self,
+        original_gaussians: TwoDGaussians,
+        projected_gaussians: Optional[TwoDGaussians],
+        file_path: str
+    ):
+        """
+        original_gaussians, projected_gaussians, カメラ行列などを pickle 化して保存
+        """
+        data = {
+            "original_gaussians": original_gaussians,
+            "projected_gaussians": projected_gaussians,
+            "viewmat": self.viewmat.detach().cpu().numpy(),
+            "K": torch.tensor([
+                [self.focal, 0, self.W / 2],
+                [0, self.focal, self.H / 2],
+                [0, 0, 1],
+            ], device=self.device).detach().cpu().numpy()
+        }
+        with open(file_path, 'wb') as f:
+            pickle.dump(data, f)
+        print(f"Saved Gaussians to {file_path}")
+
     def train(
         self,
         max_iterations: int = 1000,
@@ -184,7 +267,6 @@ class SimpleTrainer:
           - max_iterations: 総イテレーション回数
           - lr: Learning Rate
           - capture_step: フレームを保存するステップ間隔 (例: 100なら100iterごとに保存)
-        戻り値としてはフレームを返さず，内部で都度GIF用にフレームを貯める運用にする場合はここで返す必要なし。
         """
         optimizer = torch.optim.Adam([
             self.means, self.scales, self.rotations, self.rgbs, self.opacities
@@ -247,7 +329,6 @@ class SimpleTrainer:
             else:
                 gt_pre = self.gt_image
 
-            # MSE ロス
             loss = mse_loss_fn(out_pre, gt_pre)
             loss.backward()
             optimizer.step()
@@ -255,7 +336,7 @@ class SimpleTrainer:
             self.losses.append(loss.item())
             self.meta = meta
 
-            # capture_step 毎にフレームを保存
+            # capture_step 毎にフレームを保存 & ログ
             if (i+1) % capture_step == 0 or (i == max_iterations - 1):
                 frame_rgb = (out_pre.detach().cpu().numpy() * 255).clip(0,255).astype(np.uint8)
                 self.saved_frames.append(frame_rgb)
@@ -270,7 +351,7 @@ class SimpleTrainer:
 
     def get_final_params(self) -> dict:
         """
-        学習後のパラメータを dict で返し、次の画像の初期値として引き継ぐ。
+        学習後のパラメータを dict で返し、次の画像の初期値として引き継げる。
         """
         return {
             "means":     self.means.detach().clone(),
@@ -280,16 +361,25 @@ class SimpleTrainer:
             "opacities": self.opacities.detach().clone(),
         }
 
+
 def main():
     #=== ユーザ設定 ===#
     folder = Path("/groups/gag51404/ide/data/DTU/scan63/images")
-    output_dir = Path("output_gifs")  # 新しい出力フォルダ
-    output_dir.mkdir(exist_ok=True)   # フォルダが存在しない場合は作成
     
-    num_points    = 32
-    max_iters     = 2000
+    # 出力フォルダを整理
+    output_base = Path("sequential_fitting_output")
+    output_base.mkdir(exist_ok=True)
+    
+    gif_dir = output_base / "gifs"
+    pkl_dir = output_base / "pkls"
+    gif_dir.mkdir(exist_ok=True)
+    pkl_dir.mkdir(exist_ok=True)
+
+    num_points    = 500
+    max_iters     = 10000
     lr            = 0.01
     capture_step  = 10
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -302,14 +392,14 @@ def main():
     for p in image_paths:
         print(" -", p.name)
 
+    # 連番画像を順番に処理しつつ，学習結果(ガウシアン)を引き継ぐ
     prev_params = None  # 最初は None
 
-    # 各画像ごとに fitting & GIF 作成
     for idx, img_path in enumerate(image_paths):
         print(f"\n===== Fitting to {img_path.name} (index {idx}) =====")
         gt_rgb, alpha_mask = rgba_path_to_tensor(img_path, device=device)
 
-        # トレーナー
+        # Trainer を用意 (前回の結果があれば initial_params に渡す)
         trainer = SimpleTrainer(
             gt_image=gt_rgb,
             alpha_mask=alpha_mask,
@@ -321,29 +411,34 @@ def main():
         # 学習 (指定ステップごとにフレームをキャプチャ)
         trainer.train(max_iterations=max_iters, lr=lr, capture_step=capture_step)
 
-        # フレームをGIF化
+        # === GIF 保存 ===
         frames = trainer.saved_frames
-        out_gif_name = output_dir / f"train_{idx:04d}.gif"
+        out_gif_name = gif_dir / f"train_{idx:04d}.gif"
         if len(frames) > 0:
             pil_frames = [Image.fromarray(f) for f in frames]
             pil_frames[0].save(
                 out_gif_name,
                 save_all=True,
                 append_images=pil_frames[1:],
-                duration=30,  # 1フレーム当たりの表示ms
+                duration=30,
                 loop=0
             )
             print(f"Saved GIF for {img_path.name} => {out_gif_name}")
         else:
             print("No frames captured, no GIF output.")
-
-        # 使い終わったフレームはクリア (メモリ解放)
+        # フレームを破棄（メモリ解放）
         trainer.saved_frames.clear()
 
-        # 次の画像へパラメータ引き継ぎ
+        # === PKL 保存 ===
+        original_gs, projected_gs = trainer.get_gaussians()
+        out_pkl_name = pkl_dir / f"fitted_gaussians_{idx:04d}.pkl"
+        trainer.save_gaussians(original_gs, projected_gs, str(out_pkl_name))
+
+        # 次の画像にパラメータを引き継ぐ
         prev_params = trainer.get_final_params()
 
     print("All done!")
+
 
 if __name__ == "__main__":
     main()
