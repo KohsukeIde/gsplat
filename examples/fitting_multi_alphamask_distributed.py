@@ -111,7 +111,7 @@ class PlotArgs:
 
 class SimpleTrainer:
     """
-    Trains 2D gaussians to fit an image, using orthographic camera and no culling:
+    Trains 2D gaussians to fit an RGBA image, using orthographic camera and no culling:
       - camera_model="ortho"
       - eps2d=0.0
       - near_plane=-1e10, far_plane=1e10
@@ -134,57 +134,71 @@ class SimpleTrainer:
 
         self._init_gaussians(alpha_mask=alpha_mask)
 
-
     def _init_gaussians(self, alpha_mask: Optional[Tensor] = None):
         """
         Initialize random 2D gaussians *only on the foreground*, if alpha_mask is given.
-        alpha_mask: [H,W,1], 0=背景,1=前景 (or 0..1)
+        alpha_mask: [H,W,1], 0=background, 1=foreground (or 0..1)
         """
-        bd = 2
         d = 3
 
         if alpha_mask is None:
-            # 従来通り [-1,+1] にランダム配置
+            # Random placement in [-1,+1] range
+            bd = 2
             self.means = bd * (torch.rand(self.num_points, 2, device=self.device) - 0.5)
         else:
-            # 1) 前景ピクセルだけを一列に集める
-            #    alpha_mask: [H,W,1]
-            #    mask_2d: [H,W], 0/1
-            mask_2d = alpha_mask[...,0]  # shape [H,W]
+            # Extract foreground pixels
+            mask_2d = alpha_mask[..., 0]  # shape [H,W]
             foreground_indices = torch.nonzero(mask_2d > 0.5, as_tuple=False)  # shape [K,2], (y,x)
 
             if foreground_indices.shape[0] < self.num_points:
                 print("Warning: foreground has fewer pixels than num_points. Some gaussians will overlap.")
             
-            # 2) K = foreground pixel数. そこから num_points 個をランダムにサンプリング
-            #    あるいは重複可の場合は choice を繰り返す。
-            #    ここでは重複あり抽選を例示
+            # Sample num_points from foreground pixels with replacement
             K = foreground_indices.shape[0]
             chosen = torch.randint(0, K, size=(self.num_points,), device=self.device)
             chosen_xy = foreground_indices[chosen]  # shape [N,2], (y_i, x_i)
 
-            # 3) 画像ピクセル座標 [y, x] → 正規化座標 [-1,+1]
-            #    x_norm = (x / (W-1)) * 2 - 1
-            #    y_norm = (y / (H-1)) * 2 - 1
-            y = chosen_xy[:,0].float()
-            x = chosen_xy[:,1].float()
+            # Convert image pixel coordinates [y, x] to normalized coordinates [-1,+1]
+            y = chosen_xy[:, 0].float()
+            x = chosen_xy[:, 1].float()
 
-            x_norm = (x / (self.W - 1))*2.0 - 1.0
-            y_norm = (y / (self.H - 1))*2.0 - 1.0
+            x_norm = (x / (self.W - 1)) * 2.0 - 1.0
+            y_norm = (y / (self.H - 1)) * 2.0 - 1.0
 
             self.means = torch.stack([x_norm, y_norm], dim=-1)  # shape [N,2]
 
-        # スケールや回転などは従来通り
-        self.scales = torch.rand(self.num_points, 2, device=self.device)
+        # Calculate appropriate scale based on image size and number of Gaussians
+        # We want each Gaussian to cover approximately image_area / num_points
+        image_area = self.W * self.H
+        target_area_per_gaussian = image_area / self.num_points * 1.5
+        
+        # Convert to normalized coordinates scale
+        # For a circle, area = π * r²
+        # So r = sqrt(area / π)
+        target_radius_pixels = math.sqrt(target_area_per_gaussian / math.pi)
+        
+        # Convert radius from pixels to normalized coordinates [-1, 1]
+        target_radius_norm = target_radius_pixels / min(self.W, self.H) * 2.0
+        
+        # Set initial scales to this target radius (with small random variation)
+        base_scale = target_radius_norm * 0.5  # Make it a bit smaller than theoretical size
+        scale_variation = 0.2  # 20% variation
+        
+        # Initialize scales with the calculated base scale and small random variation
+        self.scales = base_scale * (1.0 + scale_variation * (torch.rand(self.num_points, 2, device=self.device) - 0.5))
+        
+        # Initialize rotations randomly
         self.rotations = torch.rand(self.num_points, device=self.device) * 2 * math.pi
+        
+        # RGB, opacity (alpha)
         self.rgbs = torch.rand(self.num_points, d, device=self.device)
         self.opacities = torch.ones(self.num_points, device=self.device)
 
-        # Z=+1 so they're clearly in front for orthographic
-        self.z_means = torch.ones(self.num_points, 1, device=self.device)
+        # Z parameters (fixed)
+        self.z_means = torch.zeros(self.num_points, 1, device=self.device)
         self.scales_z = torch.ones(self.num_points, 1, device=self.device)
 
-        # Orthographic camera
+        # View matrix (fixed)
         self.viewmat = torch.tensor(
             [
                 [1.0, 0.0, 0.0, 0.0],
@@ -195,7 +209,7 @@ class SimpleTrainer:
             device=self.device,
         )
 
-        # Make them trainable
+        # Make parameters trainable
         self.means.requires_grad = True
         self.scales.requires_grad = True
         self.rotations.requires_grad = True
@@ -203,38 +217,198 @@ class SimpleTrainer:
         self.opacities.requires_grad = True
         self.viewmat.requires_grad = False
 
-        # We'll store rasterization metadata here
+        # Store rasterization metadata
         self.meta = None
 
-        # Optional: visualize initial positions
-        self.plot_initial_means()
+        # Visualize the initial Gaussians
+        if alpha_mask is not None:
+            self.visualize_initial_gaussians()
 
-
-    def plot_initial_means(self, save_path='initial_means.png'):
-        """Plot the initial 2D means in image space."""
-        means_np = self.means.detach().cpu().numpy()
-        mx = (means_np[:, 0] + 1.0) / 2.0 * self.W
-        my = (means_np[:, 1] + 1.0) / 2.0 * self.H
-
-        plt.figure(figsize=(5, 5))
-        plt.scatter(mx, my, s=3, c='blue')
-        plt.xlim(0, self.W)
-        plt.ylim(self.H, 0)
-        plt.title("Initial 2D Gaussian Centers")
-        plt.savefig(save_path)
-        plt.close()
-        print(f"Initial means plotted: {save_path}")
+    def visualize_initial_gaussians(self):
+        """Save visualization of initial Gaussians with both points and ellipses."""
+        with torch.no_grad():
+            # Create output directory
+            os.makedirs("comparison", exist_ok=True)
+            
+            # Convert normalized coordinates to pixel coordinates for visualization
+            pixel_means = torch.zeros_like(self.means)
+            pixel_means[:, 0] = (self.means[:, 0] + 1) / 2 * (self.W - 1)  # x
+            pixel_means[:, 1] = (self.means[:, 1] + 1) / 2 * (self.H - 1)  # y
+            
+            # Create a scatter plot of initial points
+            fig, ax = plt.subplots(figsize=(10, 10))
+            
+            # Show masked GT image as background
+            ax.imshow((self.gt_image * self.alpha_mask).detach().cpu().numpy())
+                
+            # Plot the points
+            ax.scatter(
+                pixel_means[:, 0].detach().cpu().numpy(),
+                pixel_means[:, 1].detach().cpu().numpy(),
+                color='red', s=5, alpha=0.7
+            )
+            ax.set_title("Initial Gaussian Points")
+            ax.axis('off')
+            
+            # Save the initial points visualization
+            plt.savefig("comparison/initial_points.png", bbox_inches='tight')
+            plt.close(fig)
+            print("Saved initial points visualization: comparison/initial_points.png")
+            
+            # Also visualize Gaussians with ellipses
+            covs = self._get_covs()
+            self.visualize_gaussians_with_ellipses(
+                self.means.detach().cpu().numpy(),
+                covs.detach().cpu().numpy(),
+                (self.gt_image * self.alpha_mask).detach().cpu().numpy(),
+                title="Initial Gaussians",
+                save_path="comparison/initial_gaussians.png"
+            )
+            print("Saved initial Gaussians visualization: comparison/initial_gaussians.png")
 
     def _get_covs(self):
-        """Compute 2x2 covariance from (scales, rotations)."""
-        cos_r = torch.cos(self.rotations)
-        sin_r = torch.sin(self.rotations)
+        """
+        Calculate covariance matrices for all Gaussians based on scales and rotations.
+        Returns: [N,2,2] tensor of covariance matrices
+        """
+        N = self.means.shape[0]
+        
+        # Create rotation matrices
+        cos_r = torch.cos(self.rotations)  # [N]
+        sin_r = torch.sin(self.rotations)  # [N]
+        
+        # Stack rotation matrices for all Gaussians
         R = torch.stack([
             torch.stack([cos_r, -sin_r], dim=1),
             torch.stack([sin_r,  cos_r], dim=1)
         ], dim=1)  # [N, 2, 2]
+        
+        # Create scale matrices
         S = torch.diag_embed(self.scales)  # [N, 2, 2]
-        return R @ S @ S.transpose(1, 2) @ R.transpose(1, 2)  # [N,2,2]
+        
+        # Compute covariance matrices: R * S * S^T * R^T
+        covs = R @ S @ S.transpose(1, 2) @ R.transpose(1, 2)  # [N,2,2]
+        
+        return covs
+
+    def visualize_masked_results(self, gt_img_masked, out_img_masked, title_prefix=""):
+        """
+        Create a side-by-side comparison of GT, output, and error map, then save as PNG.
+        """
+        # Convert PyTorch tensors to numpy if needed
+        if hasattr(gt_img_masked, 'detach'):
+            gt_img_masked = gt_img_masked.detach().cpu().numpy()
+        if hasattr(out_img_masked, 'detach'):
+            out_img_masked = out_img_masked.detach().cpu().numpy()
+
+        gt_img_masked = gt_img_masked.clip(0.0, 1.0)
+        out_img_masked = out_img_masked.clip(0.0, 1.0)
+        diff_map = (gt_img_masked - out_img_masked) ** 2
+        mse_value = diff_map.mean()
+
+        # Create comparison image
+        fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+        axs[0].imshow(gt_img_masked)
+        axs[0].set_title(f"GT Masked")
+        axs[1].imshow(out_img_masked)
+        axs[1].set_title(f"{title_prefix} Output")
+        im_2 = axs[2].imshow(diff_map, cmap='jet', vmin=0, vmax=np.max(diff_map))
+        axs[2].set_title(f"MSE={mse_value:.6f}")
+        fig.colorbar(im_2, ax=axs[2], fraction=0.046, pad=0.04)
+
+        for ax in axs:
+            ax.axis('off')
+
+        plt.tight_layout()
+        os.makedirs("comparison", exist_ok=True)
+        save_path = f"comparison/{title_prefix.replace(' ', '_')}.png"
+        plt.savefig(save_path, bbox_inches='tight', dpi=150)
+        print(f"Saved comparison image: {save_path}")
+        plt.close()
+
+    def visualize_gaussians_with_ellipses(self, means, covs, rgb_image=None, title="", save_path=None):
+        """
+        Draw Gaussian ellipses on an image or blank canvas.
+        
+        Args:
+            means: [N,2] array of Gaussian means
+            covs: [N,2,2] array of covariance matrices
+            rgb_image: Optional background image
+            title: Title for the plot
+            save_path: Where to save the visualization
+        """
+        # Create figure and axis
+        fig, ax = plt.subplots(figsize=(10, 10))
+        
+        # If we have a background image, display it
+        if rgb_image is not None:
+            if hasattr(rgb_image, 'detach'):
+                rgb_image = rgb_image.detach().cpu().numpy()
+            rgb_image = rgb_image.clip(0, 1)
+            ax.imshow(rgb_image)
+        else:
+            # Otherwise create a blank canvas
+            ax.set_xlim(-1, 1)
+            ax.set_ylim(-1, 1)
+            ax.set_facecolor('black')
+        
+        # Draw ellipses for each Gaussian
+        for i, (mean, cov) in enumerate(zip(means, covs)):
+            # Skip NaN values
+            if np.any(np.isnan(mean)) or np.any(np.isnan(cov)):
+                continue
+            
+            # Convert normalized coordinates to pixel coordinates if needed
+            if rgb_image is not None and np.max(np.abs(mean)) <= 1.0:
+                # Convert from [-1,1] to pixel coordinates
+                mean_px = np.array([(mean[0] + 1) / 2 * (self.W - 1), 
+                                  (mean[1] + 1) / 2 * (self.H - 1)])
+                # Scale covariance matrix to pixel space
+                scale_matrix = np.array([[self.W/2, 0], [0, self.H/2]])
+                cov_px = scale_matrix @ cov @ scale_matrix.T
+            else:
+                mean_px = mean
+                cov_px = cov
+            
+            try:
+                # Get eigenvalues and eigenvectors
+                eigenvals, eigenvecs = np.linalg.eigh(cov_px)
+                order = eigenvals.argsort()[::-1]
+                eigenvals = eigenvals[order]
+                eigenvecs = eigenvecs[:, order]
+                
+                # Skip invalid eigenvalues
+                if np.any(eigenvals <= 0):
+                    continue
+                
+                # Calculate angle in degrees
+                angle = np.degrees(np.arctan2(*eigenvecs[:, 0][::-1]))
+                
+                # Calculate width and height (2 standard deviations)
+                width, height = 2 * 2 * np.sqrt(eigenvals)
+                
+                # Create ellipse
+                ellipse = plt.matplotlib.patches.Ellipse(
+                    xy=mean_px, width=width, height=height, angle=angle,
+                    edgecolor='red', facecolor='none', linewidth=1, alpha=0.7
+                )
+                ax.add_patch(ellipse)
+            except (np.linalg.LinAlgError, ValueError):
+                # Skip problematic Gaussians
+                continue
+        
+        ax.set_title(title)
+        if rgb_image is None:
+            ax.invert_yaxis()  # Invert y-axis for normalized coordinates
+        ax.axis('off')
+        
+        # Save the figure
+        if save_path:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            plt.savefig(save_path, bbox_inches='tight', dpi=150)
+            print(f"Saved ellipse visualization to {save_path}")
+        
+        plt.close(fig)
 
     def get_gaussians(self) -> Tuple[TwoDGaussians, Optional[TwoDGaussians]]:
         """
@@ -253,35 +427,36 @@ class SimpleTrainer:
             scales=self.scales.detach().cpu().numpy(),
         )
 
+        projected_gs = None
         if self.meta is not None:
-            # Subset attributes for the projected Gaussians
-            means2d = self.meta['means2d'].detach().cpu().numpy()   # [M,2]
-            conics = self.meta['conics'].detach().cpu().numpy()     # [M,3]
-            M = means2d.shape[0]
+            if 'means2d' in self.meta and 'conics' in self.meta:
+                # Extract projected means and conics
+                means2d = self.meta['means2d'].detach().cpu().numpy()   # [M,2]
+                conics = self.meta['conics'].detach().cpu().numpy()     # [M,3]
+                M = means2d.shape[0]
 
-            A = conics[:, 0]
-            B = conics[:, 1]
-            C = conics[:, 2]
-            inv_covs = np.zeros((M, 2, 2))
-            inv_covs[:, 0, 0] = A
-            inv_covs[:, 0, 1] = B / 2
-            inv_covs[:, 1, 0] = B / 2
-            inv_covs[:, 1, 1] = C
-            covs2d = np.linalg.inv(inv_covs)  # [M,2,2]
+                # Convert conics to covariance matrices
+                A = conics[:, 0]
+                B = conics[:, 1]
+                C = conics[:, 2]
+                inv_covs = np.zeros((M, 2, 2))
+                inv_covs[:, 0, 0] = A
+                inv_covs[:, 0, 1] = B / 2
+                inv_covs[:, 1, 0] = B / 2
+                inv_covs[:, 1, 1] = C
+                covs2d = np.linalg.inv(inv_covs)  # [M,2,2]
 
-            print(f"Projected: {M}/{self.num_points} Gaussians appear on-screen.")
+                print(f"Projected: {M}/{self.num_points} Gaussians appear on-screen.")
 
-            # Subset rgb, alpha, rotations, scales to match projected Gaussians
-            projected_gs = TwoDGaussians(
-                means=means2d,                 # [M,2]
-                covs=covs2d,                   # [M,2,2]
-                rgb=torch.sigmoid(self.rgbs).detach().cpu().numpy()[:M],  # Subset [M,3]
-                alpha=torch.sigmoid(self.opacities).detach().cpu().numpy()[:M],  # Subset [M]
-                rotations=self.rotations.detach().cpu().numpy()[:M],  # Subset [M]
-                scales=self.scales.detach().cpu().numpy()[:M],        # Subset [M,2]
-            )
-        else:
-            projected_gs = None
+                # Subset RGB, alpha, rotations, scales to match projected Gaussians
+                projected_gs = TwoDGaussians(
+                    means=means2d,                 # [M,2]
+                    covs=covs2d,                   # [M,2,2]
+                    rgb=torch.sigmoid(self.rgbs).detach().cpu().numpy()[:M],  # Subset [M,3]
+                    alpha=torch.sigmoid(self.opacities).detach().cpu().numpy()[:M],  # Subset [M]
+                    rotations=self.rotations.detach().cpu().numpy()[:M],  # Subset [M]
+                    scales=self.scales.detach().cpu().numpy()[:M],        # Subset [M,2]
+                )
 
         return original_gs, projected_gs
 
@@ -341,23 +516,22 @@ class SimpleTrainer:
                 torch.sigmoid(self.opacities).unsqueeze(-1),   # shape [N,1]
             ], dim=-1)  # => shape [N,4]
 
-            # opacities 引数はダミー(全1)を渡す：実際は `colors=rgba_for_raster` のAを使う
+            # Use dummy opacities (all 1s) since we're using RGBA with alpha
             dummy_opacities = torch.ones_like(self.opacities)
 
             # --- Rasterization ---
-            # Expecting out_img shape [H,W,4] if the rasterizer picks up 4 channels
+            # Expecting out_img shape [H,W,4] with RGBA channels
             renders, _, meta = rasterization(
                 means_3d,
                 quats_norm,
                 scales_3d,
-                dummy_opacities,      # ダミー
+                dummy_opacities,
                 rgba_for_raster,      # [N,4]
                 self.viewmat[None],
                 K[None],
                 self.W,
                 self.H,
-                # もし rasterization がカラーチャンネル数を自動解釈する場合、render_mode 指定は不要かも
-                # render_mode="RGB",   # (内部で4ch出力されるか要確認)
+                camera_model="ortho"  # Use orthographic camera model
             )
 
             out_rgba = renders[0]  # shape [H,W,4]
@@ -365,20 +539,21 @@ class SimpleTrainer:
                 torch.cuda.synchronize()
             times[0] += time.time() - start
 
-            # --- (RGB x alpha) で背景を黒化 ---
-            out_rgb   = out_rgba[..., :3]
-            out_alpha = out_rgba[..., 3:4]
-            out_pre   = out_rgb * out_alpha  # [H,W,3], pre-multiplied
+            # --- Extract RGB and alpha components ---
+            out_rgb   = out_rgba[..., :3]   # [H,W,3]
+            out_alpha = out_rgba[..., 3:4]  # [H,W,1]
+            
+            # --- Apply pre-multiplied alpha (background becomes black) ---
+            out_pre = out_rgb * out_alpha  # [H,W,3], pre-multiplied
 
-            # --- 同様に GT 側も alpha_mask があるなら pre-multiplied
+            # --- GT side also uses pre-multiplied alpha if mask exists ---
             if self.alpha_mask is not None:
                 # shape [H,W,3]
-                gt_pre = self.gt_image * self.alpha_mask.expand(-1,-1,3)
+                gt_pre = self.gt_image * self.alpha_mask
             else:
-                # alpha_mask が無ければ普通に GT
                 gt_pre = self.gt_image
 
-            # --- MSE ---
+            # --- Calculate MSE loss ---
             loss = mse_loss_fn(out_pre, gt_pre)
 
             start = time.time()
@@ -391,26 +566,54 @@ class SimpleTrainer:
             optimizer.step()
             self.meta = meta
 
+            # --- Print progress ---
+            if i % 100 == 0:
+                print(f"Iter {i}/{max_iterations}, Loss: {loss.item():.6f}")
+                
+                # Save intermediate visualizations
+                if save_imgs and i % 1000 == 0:
+                    with torch.no_grad():
+                        # Compare GT and rendered output
+                        self.visualize_masked_results(
+                            gt_pre,
+                            out_pre,
+                            title_prefix=f"Iter_{i}"
+                        )
+                        
+                        # Visualize Gaussians if we have projected info
+                        if 'means2d' in meta:
+                            means2d = meta['means2d'].detach().cpu().numpy()
+                            covs = self._get_covs().detach().cpu().numpy()
+                            
+                            self.visualize_gaussians_with_ellipses(
+                                means2d,
+                                covs,
+                                out_pre.detach().cpu().numpy(),
+                                title=f"Gaussians at Iteration {i}",
+                                save_path=f"comparison/gaussians_iter_{i}.png"
+                            )
+
             # --- Checkpoint & metrics ---
             if (i + 1) in checkpoint_iterations:
-                # CPUに取り出して可視化など
+                # Extract output image for metrics
                 final_out_img = out_pre.detach().cpu().numpy()  # [H,W,3]
 
                 if gt_np is not None:
                     if self.alpha_mask is not None:
-                        # GTにもαをかけたものを NumPy化
+                        # Apply alpha to GT for metrics
                         alpha_np = self.alpha_mask.detach().cpu().numpy()
                         gt_pre_np = gt_np * alpha_np
                     else:
                         gt_pre_np = gt_np
 
-                    psnr_val  = calculate_psnr(final_out_img, gt_pre_np, max_val=1.0)
+                    # Calculate metrics
+                    psnr_val = calculate_psnr(final_out_img, gt_pre_np, max_val=1.0)
                     lpips_val = calculate_lpips(final_out_img, gt_pre_np, device=device)
-                    ssim_val  = calculate_ssim(final_out_img, gt_pre_np, device=device)
+                    ssim_val = calculate_ssim(final_out_img, gt_pre_np, device=device)
                 else:
-                    psnr_val  = -1
+                    psnr_val = -1
                     lpips_val = -1
-                    ssim_val  = -1
+                    ssim_val = -1
 
                 results.append({
                     "iteration": i + 1,
@@ -420,14 +623,21 @@ class SimpleTrainer:
                 })
                 print(f"Iter {i+1}/{max_iterations}, Loss={loss.item():.6f}, PSNR={psnr_val:.4f}, LPIPS={lpips_val:.4f}, SSIM={ssim_val:.4f}")
 
-            # --- Save frames to GIF ---
+            # --- Save frames for GIF ---
             if save_imgs and ((i + 1) % 5 == 0):
-                # out_pre (背景黒) か out_rgba (背景色つき) など、お好みで可視化
                 frame_rgb = (out_pre.detach().cpu().numpy() * 255).clip(0,255).astype(np.uint8)
                 frames.append(frame_rgb)
 
         print(f"[Timing] Total: Rasterization: {times[0]:.3f}s, Backward: {times[1]:.3f}s")
         print(f"[Timing] Per step: R={times[0]/max_iterations:.6f}, B={times[1]/max_iterations:.6f}")
+
+        # --- Final visualization ---
+        if save_imgs:
+            self.visualize_masked_results(
+                gt_pre.detach().cpu().numpy(),
+                out_pre.detach().cpu().numpy(),
+                title_prefix="Final"
+            )
 
         # --- Save final Gaussians ---
         original_gs, projected_gs = self.get_gaussians()
@@ -467,25 +677,21 @@ class SimpleTrainer:
 
     def save_gaussians(self, original_gs: TwoDGaussians, projected_gs: Optional[TwoDGaussians], path: str):
         import pickle
-        # Modified to use the expected keys
+        # Include both the original and projected Gaussians
         data = {
             'original_gaussians': original_gs,
             'projected_gaussians': projected_gs,
-            'viewmat': torch.tensor([
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 8.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ]),  # Adding the viewmat used in training
+            'viewmat': self.viewmat.detach().cpu().numpy(),
             'K': torch.tensor([
                 [self.focal, 0, self.W/2],
                 [0, self.focal, self.H/2],
                 [0, 0, 1],
-            ])  # Adding the camera intrinsics matrix
+            ]).detach().cpu().numpy(),
+            'image_size': (self.W, self.H)  # Explicitly save the image dimensions
         }
         with open(path, 'wb') as f:
             pickle.dump(data, f)
-        print(f"Saved Gaussians to: {path}")
+        print(f"Saved Gaussians to: {path} with image size {(self.W, self.H)}")
 
 
 def image_path_to_tensor(image_path: Path, device: torch.device = None) -> Tensor:
@@ -500,9 +706,9 @@ def image_path_to_tensor(image_path: Path, device: torch.device = None) -> Tenso
 
 def rgba_path_to_tensor(image_path: Path, device: torch.device=None) -> Tuple[Tensor, Tensor]:
     """
-    4チャンネル RGBA 画像を読み込み、(rgb, alpha) の2つに分けて返す。
+    Load a 4-channel RGBA image and split into (rgb, alpha).
       - rgb:   [H,W,3] in [0..1]
-      - alpha: [H,W,1] in [0..1], 0=背景, 1=前景など
+      - alpha: [H,W,1] in [0..1], 0=background, 1=foreground
     """
     from torchvision import transforms
     img = Image.open(image_path).convert("RGBA")  # 4ch
@@ -621,18 +827,18 @@ def _train_on_image(
     device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
     print(f"[GPU {gpu_id}] Training on {img_path.name} ...")
 
-    # RGBA読み込み
+    # Load RGBA image
     gt_rgb, alpha_mask = rgba_path_to_tensor(img_path, device=device)
-
     gt_np = gt_rgb.cpu().numpy()
 
-    # trainerに alpha_mask を渡す
+    # Create trainer with alpha mask
     trainer = SimpleTrainer(
         gt_image=gt_rgb,
         num_points=num_points,
         alpha_mask=alpha_mask
     )
 
+    # Train with checkpoints at the requested iterations
     trainer.train(
         max_iterations=iterations,
         checkpoint_iterations=[iterations],
@@ -661,18 +867,22 @@ def _experiment_on_image(
     device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
     print(f"[GPU {gpu_id}] Experiment on {img_path.name} ...")
 
-    gt_image = image_path_to_tensor(img_path, device=device)
-    gt_np = gt_image.cpu().numpy()
+    # Load RGBA image
+    gt_rgb, alpha_mask = rgba_path_to_tensor(img_path, device=device)
+    gt_np = gt_rgb.cpu().numpy()
 
     results_for_image = []
 
-    # For each npoints, run a single training up to max(iterations_list).
-    # The train function uses "checkpoint_iterations=iterations_list" to log at each checkpoint
+    # For each npoints, run a single training up to max(iterations_list)
     for npoints in num_points_list:
         print(f"[GPU {gpu_id}] -> {img_path.name}, npoints={npoints}")
-        trainer = SimpleTrainer(gt_image=gt_image, num_points=npoints)
+        trainer = SimpleTrainer(
+            gt_image=gt_rgb, 
+            num_points=npoints,
+            alpha_mask=alpha_mask
+        )
 
-        # Train until the maximum iteration
+        # Train until the maximum iteration with checkpoints at each specified iteration
         all_metrics = trainer.train(
             max_iterations=max(iterations_list),
             checkpoint_iterations=iterations_list,
@@ -682,14 +892,12 @@ def _experiment_on_image(
             device=device,
         )
 
-        # all_metrics is a list of dictionaries: 
-        # [{"iteration": i, "psnr": p, "lpips": l, "ssim": s}, ...]
+        # Gather metrics from checkpoints
         for metrics in all_metrics:
-            # Gather them into the results_for_image structure
             results_for_image.append({
                 "image_name": img_path.name,
                 "num_points": npoints,
-                "iterations": metrics["iteration"],  # iteration from the checkpoint
+                "iterations": metrics["iteration"],
                 "psnr": metrics["psnr"],
                 "lpips": metrics["lpips"],
                 "ssim": metrics["ssim"],
@@ -787,19 +995,29 @@ def main():
                         gpu_id=0
                     )
         else:
-            # Single image or synthetic
+            # Single image
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             if args.img_path:
-                gt_image = image_path_to_tensor(Path(args.img_path), device=device)
+                # Load RGBA image
+                gt_rgb, alpha_mask = rgba_path_to_tensor(args.img_path, device=device)
             else:
-                gt_image = generate_synthetic_image(device, height=args.height, width=args.width)
+                # Generate synthetic image with no alpha mask
+                gt_rgb = generate_synthetic_image(device, height=args.height, width=args.width)
+                alpha_mask = None
 
-            trainer = SimpleTrainer(gt_image=gt_image, num_points=args.num_points)
+            trainer = SimpleTrainer(
+                gt_image=gt_rgb, 
+                num_points=args.num_points,
+                alpha_mask=alpha_mask
+            )
+            
             trainer.train(
-                iterations=args.iterations,
+                max_iterations=args.iterations,
+                checkpoint_iterations=[args.iterations],
                 lr=args.lr,
                 save_imgs=args.save_imgs,
-                output_pkl=args.output_path
+                output_pkl=args.output_path,
+                device=device
             )
             trainer.plot_loss(save_path="loss_curve.png")
 
@@ -919,14 +1137,15 @@ def main():
             if args.auto_plot:
                 plot_results_from_csv(args.output_log)
         else:
-            # Single image or synthetic
+            # Single image experiment
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             if args.img_path:
                 img_path = Path(args.img_path)
-                gt_image = image_path_to_tensor(img_path, device=device)
+                gt_rgb, alpha_mask = rgba_path_to_tensor(img_path, device=device)
                 image_name = img_path.name
             else:
-                gt_image = generate_synthetic_image(device)
+                gt_rgb = generate_synthetic_image(device)
+                alpha_mask = None
                 image_name = "synthetic"
 
             with open(args.output_log, "w", newline='') as f:
@@ -936,23 +1155,34 @@ def main():
             for np_ in args.num_points_list:
                 for it_ in args.iterations_list:
                     print(f"[EXPERIMENT single] npoints={np_}, iters={it_}")
-                    trainer = SimpleTrainer(gt_image=gt_image, num_points=np_)
-                    _, _, final_img = trainer.train(iterations=it_, lr=args.lr, save_imgs=args.save_imgs)
-                    gt_np = gt_image.cpu().numpy()
-                    psnr_val = calculate_psnr(final_img, gt_np, max_val=1.0)
-                    lpips_val = calculate_lpips(final_img, gt_np, device=device)
-                    ssim_val = calculate_ssim(final_img, gt_np, device=device)
-
-                    with open(args.output_log, "a", newline='') as f:
-                        w = csv.DictWriter(f, fieldnames=fieldnames)
-                        w.writerow({
-                            "image_name": image_name,
-                            "num_points": np_,
-                            "iterations": it_,
-                            "psnr": psnr_val,
-                            "lpips": lpips_val,
-                            "ssim": ssim_val
-                        })
+                    trainer = SimpleTrainer(
+                        gt_image=gt_rgb, 
+                        num_points=np_,
+                        alpha_mask=alpha_mask
+                    )
+                    
+                    # Train to the specified iteration with a single checkpoint
+                    metrics = trainer.train(
+                        max_iterations=it_,
+                        checkpoint_iterations=[it_],
+                        lr=args.lr,
+                        save_imgs=args.save_imgs,
+                        device=device
+                    )
+                    
+                    # Get metrics from the checkpoint
+                    if metrics:
+                        metric = metrics[0]  # Just one checkpoint
+                        with open(args.output_log, "a", newline='') as f:
+                            w = csv.DictWriter(f, fieldnames=fieldnames)
+                            w.writerow({
+                                "image_name": image_name,
+                                "num_points": np_,
+                                "iterations": it_,
+                                "psnr": metric["psnr"],
+                                "lpips": metric["lpips"],
+                                "ssim": metric["ssim"]
+                            })
 
             print(f"Results saved to {args.output_log}")
             if args.auto_plot:

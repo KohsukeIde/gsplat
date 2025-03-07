@@ -5,7 +5,7 @@
 # (optional) nerfacc for torch version rasterization 
 # git+https://github.com/nerfstudio-project/nerfacc
 
-viser
+viser==0.2.7
 nerfview==0.0.3
 imageio[ffmpeg]
 numpy<2.0.0

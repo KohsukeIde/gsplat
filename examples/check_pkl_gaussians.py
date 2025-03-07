@@ -14,11 +14,24 @@ def load_gaussians(pickle_path: str, device: torch.device) -> tuple:
     try:
         with open(pickle_path, 'rb') as f:
             data = pickle.load(f)
+            
+            # Debug output to see all available data
+            print(f"PKL file keys: {list(data.keys())}")
+            
+            # Extract data from the pickle file
             original_gaussians = data["original_gaussians"]
-            projected_gaussians = data["projected_gaussians"]
+            projected_gaussians = data.get("projected_gaussians", None)
             viewmat = torch.tensor(data["viewmat"], dtype=torch.float32, device=device)
             K = torch.tensor(data["K"], dtype=torch.float32, device=device)
-        return original_gaussians, projected_gaussians, viewmat, K
+            
+            # Extract image size if available, otherwise None
+            image_size = data.get("image_size", None)
+            if image_size:
+                print(f"Found image size in PKL: {image_size}")
+            else:
+                print("No image_size in PKL, will estimate from K matrix")
+                
+        return original_gaussians, projected_gaussians, viewmat, K, image_size
     except Exception as e:
         print(f"Error loading pickle file: {e}")
         print(f"File path: {pickle_path}")
@@ -61,53 +74,82 @@ def render_gaussians(
     projected_gaussians: TwoDGaussians,
     viewmat: torch.Tensor,
     K: torch.Tensor,
-    image_size: tuple = (256, 256),
-    draw_ellipses: bool = True,  # 楕円を描画するかどうかのフラグ
+    image_size: tuple = None,
+    draw_ellipses: bool = True,
 ) -> np.ndarray:
-    device = viewmat.device  # viewmat のデバイスを取得
-
-    # original_gaussians を使用してレンダリングを行う
-    means = torch.tensor(original_gaussians.means, device=device, dtype=torch.float32)        # [k, 2]
-    rotations = torch.tensor(original_gaussians.rotations, device=device, dtype=torch.float32)  # [k]
-    scales = torch.tensor(original_gaussians.scales, device=device, dtype=torch.float32)        # [k, 2]
-    rgbs = torch.tensor(original_gaussians.rgb, device=device, dtype=torch.float32)            # [k, 3]
-    alphas = torch.tensor(original_gaussians.alpha, device=device, dtype=torch.float32)        # [k]
-
-    # 3DのMeanを再構築（z=0を追加）
-    z_means = torch.zeros((means.shape[0], 1), device=device)  # [k, 1]
-    means_3d = torch.cat([means, z_means], dim=1)  # [k, 3]
-
-    # Z軸のスケールは1に固定
-    scales_z = torch.ones((scales.shape[0], 1), device=device)  # [k, 1]
-    scales_3d = torch.cat([scales, scales_z], dim=1)  # [k, 3]
-
-    # クォータニオンを再構築（Z軸周りの回転）
+    device = viewmat.device
+    
+    # Fallback to estimating from K if image_size is None
+    if image_size is None:
+        width = int(K[0, 2].item() * 2)
+        height = int(K[1, 2].item() * 2)
+        image_size = (width, height)
+        print(f"Using estimated image size from K: {image_size}")
+    
+    print(f"Rendering with dimensions: {image_size}")
+    
+    # Debug information to understand what's in the PKL file
+    print(f"Original gaussians: {len(original_gaussians.means)} points")
+    if projected_gaussians:
+        print(f"Projected gaussians: {len(projected_gaussians.means)} points")
+    else:
+        print("No projected gaussians")
+    
+    # Get original_gaussians parameters
+    means = torch.tensor(original_gaussians.means, device=device, dtype=torch.float32)
+    rotations = torch.tensor(original_gaussians.rotations, device=device, dtype=torch.float32)
+    scales = torch.tensor(original_gaussians.scales, device=device, dtype=torch.float32)
+    rgbs = torch.tensor(original_gaussians.rgb, device=device, dtype=torch.float32)
+    alphas = torch.tensor(original_gaussians.alpha, device=device, dtype=torch.float32)
+    
+    # Build 3D parameters
+    z_means = torch.zeros((means.shape[0], 1), device=device)
+    means_3d = torch.cat([means, z_means], dim=1)
+    
+    scales_z = torch.ones((scales.shape[0], 1), device=device)
+    scales_3d = torch.cat([scales, scales_z], dim=1)
+    
+    # Create quaternions
     quats = torch.stack([
         torch.cos(rotations / 2),
         torch.zeros_like(rotations),
         torch.zeros_like(rotations),
         torch.sin(rotations / 2)
-    ], dim=1)  # [k, 4]
-    quats_normalized = quats / quats.norm(dim=-1, keepdim=True)  # [k, 4]
-
-    # ラスタライゼーションを実行
+    ], dim=1)
+    quats_normalized = quats / quats.norm(dim=-1, keepdim=True)
+    
+    # Combine RGB and Alpha into RGBA to match training
+    rgba_for_raster = torch.cat([rgbs, alphas.unsqueeze(-1)], dim=-1)
+    
+    # Use dummy_opacities like in training
+    dummy_opacities = torch.ones_like(alphas)
+    
+    # Call rasterization with camera_model="ortho" to match training
     renders, _, _ = rasterization(
-        means_3d,                # [k, 3]
-        quats_normalized,        # [k, 4]
-        scales_3d,               # [k, 3]
-        alphas,                  # [k]
-        rgbs,                    # [k, 3]
-        viewmat[None],           # [1, 4, 4]
-        K[None],                 # [1, 3, 3]
+        means_3d,
+        quats_normalized,
+        scales_3d,
+        dummy_opacities,
+        rgba_for_raster,
+        viewmat[None],
+        K[None],
         image_size[0],
         image_size[1],
-        packed=False  # 追加：packed=Falseに設定
+        camera_model="ortho",  # Important: Match the training setting
+        packed=False
     )
-    out_img = renders[0].detach().cpu().numpy()  # [H, W, 3]
-
-    # uint8に変換して0-255の範囲に収める
-    out_img_uint8 = (out_img * 255).clip(0, 255).astype(np.uint8)
-
+    
+    # Process output like in training
+    out_rgba = renders[0].detach().cpu().numpy()
+    
+    # Apply pre-multiplied alpha like in training
+    out_rgb = out_rgba[..., :3]
+    out_alpha = out_rgba[..., 3:4]
+    out_premult = out_rgb * out_alpha
+    
+    # Convert to uint8
+    out_img_uint8 = (out_premult * 255).clip(0, 255).astype(np.uint8)
+    
     # 楕円を描画する場合
     if draw_ellipses and projected_gaussians is not None:
         # ガウス分布の2D位置と共分散行列を取得
@@ -140,19 +182,100 @@ def save_image(image_array: np.ndarray, save_path: str):
     img.save(save_path)
     print(f"Rendered image saved to {save_path}")
 
-def main(pickle_path: str, output_image_path: str, image_size: tuple = (256, 256)):
+def main(pickle_path: str, output_dir: str = None, image_size: tuple = None):
+    """
+    Process a single pickle file or all pickle files in a directory.
+    
+    Args:
+        pickle_path: Path to a pickle file or directory containing pickle files
+        output_dir: Directory to save output images (defaults to same as input)
+        image_size: Size of the output image (only used if not in the PKL)
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    original_gaussians, projected_gaussians, viewmat, K = load_gaussians(pickle_path, device=device)
-    rendered_image = render_gaussians(original_gaussians, projected_gaussians, viewmat, K, image_size=image_size, draw_ellipses=True)
-    save_image(rendered_image, output_image_path)
+    
+    # Check if pickle_path is a directory
+    if os.path.isdir(pickle_path):
+        # Process all pickle files in the directory
+        if output_dir is None:
+            output_dir = pickle_path
+        
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Find all pickle files
+        pkl_files = [f for f in os.listdir(pickle_path) if f.endswith('.pkl')]
+        
+        if not pkl_files:
+            print(f"No pickle files found in {pickle_path}")
+            return
+            
+        print(f"Found {len(pkl_files)} pickle files to process")
+        
+        # Process each pickle file
+        for pkl_file in pkl_files:
+            pkl_path = os.path.join(pickle_path, pkl_file)
+            # Create output filenames with same base name but .png extension
+            base_filename = os.path.splitext(pkl_file)[0]
+            output_path_without_ellipses = os.path.join(output_dir, base_filename + '_without_ellipses.png')
+            output_path_with_ellipses = os.path.join(output_dir, base_filename + '_with_ellipses.png')
+            
+            try:
+                print(f"Processing {pkl_file}...")
+                original_gaussians, projected_gaussians, viewmat, K, pkl_image_size = load_gaussians(pkl_path, device=device)
+                
+                # Use the image size from PKL if available, otherwise use the provided default
+                current_image_size = pkl_image_size if pkl_image_size is not None else image_size
+                print(f"Rendering with image size: {current_image_size}")
+                
+                # Render without ellipses
+                rendered_image = render_gaussians(original_gaussians, projected_gaussians, viewmat, K, 
+                                                 image_size=current_image_size, draw_ellipses=False)
+                save_image(rendered_image, output_path_without_ellipses)
+                
+                # Render with ellipses
+                rendered_image_with_ellipses = render_gaussians(original_gaussians, projected_gaussians, viewmat, K, 
+                                                               image_size=current_image_size, draw_ellipses=True)
+                save_image(rendered_image_with_ellipses, output_path_with_ellipses)
+            except Exception as e:
+                print(f"Error processing {pkl_file}: {e}")
+    else:
+        # Process a single file
+        if output_dir is None:
+            output_dir = os.path.dirname(pickle_path)
+            if not output_dir:
+                output_dir = '.'
+        
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Create output filenames with same base name but .png extension
+        base_filename = os.path.splitext(os.path.basename(pickle_path))[0]
+        output_path_without_ellipses = os.path.join(output_dir, base_filename + '_without_ellipses.png')
+        output_path_with_ellipses = os.path.join(output_dir, base_filename + '_with_ellipses.png')
+        
+        original_gaussians, projected_gaussians, viewmat, K, pkl_image_size = load_gaussians(pickle_path, device=device)
+        
+        # Use the image size from PKL if available, otherwise use the provided default
+        current_image_size = pkl_image_size if pkl_image_size is not None else image_size
+        print(f"Rendering with image size: {current_image_size}")
+        
+        # Render without ellipses
+        rendered_image = render_gaussians(original_gaussians, projected_gaussians, viewmat, K, 
+                                         image_size=current_image_size, draw_ellipses=False)
+        save_image(rendered_image, output_path_without_ellipses)
+        
+        # Render with ellipses
+        rendered_image_with_ellipses = render_gaussians(original_gaussians, projected_gaussians, viewmat, K, 
+                                                       image_size=current_image_size, draw_ellipses=True)
+        save_image(rendered_image_with_ellipses, output_path_with_ellipses)
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Render Gaussians from Pickle File")
     parser.add_argument("--pickle_path", type=str, help="Path to the fitted_gaussians.pkl file")
-    parser.add_argument("--output_image_path", type=str, help="Path to save the rendered image")
+    parser.add_argument("--output_dir", type=str, help="Directory to save output images")
     parser.add_argument("--image_size", type=int, nargs=2, default=[1554, 1162], help="Width and height of the output image")
 
     args = parser.parse_args()
-    main(args.pickle_path, args.output_image_path, tuple(args.image_size))
+    main(args.pickle_path, args.output_dir, tuple(args.image_size))
